@@ -1,0 +1,23 @@
+{
+  "name": "minecraft-telegram-bot",
+  "version": "1.0.0",
+  "description": "Mineflayer bot with Telegram control panel",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "mineflayer": "^4.23.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "node-telegram-bot-api": "^0.66.0",
+    "sharp": "^0.33.4"
+  },
+  "allowScripts": {
+    "sharp@0.33.5": true
+  }
+}
