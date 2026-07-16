@@ -586,9 +586,22 @@ class MinecraftBot {
       }
     };
 
+    let lastDigTime = Date.now();
+
     while (this.isMining && this.bot && this.isConnected) {
       try {
         if (!this.bot.entity || !this.bot.entity.position) { await this.sleep(1000); continue; }
+
+        // Если за 12 секунд ни одного блока не сломано — перезапуск итерации
+        if (Date.now() - lastDigTime > 12000) {
+          console.log(`[MC ${this.username}] Idle 12s, restarting mineLoop iteration`);
+          if (this.bot.pathfinder) this.bot.pathfinder.stop();
+          this.bot.clearControlStates();
+          try { this.bot.stopDigging(); } catch(_) {}
+          lastDigTime = Date.now();
+          await this.sleep(500);
+          continue;
+        }
 
         this.bot.clearControlStates();
         await this.clearJunk();
@@ -652,6 +665,13 @@ class MinecraftBot {
               break;
             }
           }
+
+          // Проверка idle 12 сек (даже во время навигации)
+          if (Date.now() - lastDigTime > 12000) {
+            if (this.bot.pathfinder) this.bot.pathfinder.stop();
+            navDone = true;
+            break;
+          }
           
           // Проверка застревания
           const curDist = this.bot.entity.position.distanceTo(targetPos);
@@ -663,7 +683,7 @@ class MinecraftBot {
             if (noProgressTicks >= 8) { // 4 секунды без приближения
               if (this.bot.pathfinder) this.bot.pathfinder.stop();
               this.bot.clearControlStates();
-              this.badBlocks.set(key, Date.now() + 15000);
+              this.badBlocks.set(key, Date.now() + 22000);
               navDone = true;
               break;
             }
@@ -678,13 +698,14 @@ class MinecraftBot {
           if (block && block.type !== 0 && block.name !== 'air' && block.name !== 'cave_air') {
             try {
               await this.bot.dig(block, true);
+              lastDigTime = Date.now(); // Успешно сломали блок
             } catch (err) {
               try { this.bot.stopDigging(); } catch(_) {}
-              this.badBlocks.set(key, Date.now() + 15000);
+              this.badBlocks.set(key, Date.now() + 22000);
             }
           }
         } else {
-          this.badBlocks.set(key, Date.now() + 15000);
+          this.badBlocks.set(key, Date.now() + 22000);
         }
 
       } catch (err) {
