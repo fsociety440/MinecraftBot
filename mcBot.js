@@ -456,7 +456,8 @@ class MinecraftBot {
     const keepItems = [
       'netherite_pickaxe', 'diamond_pickaxe', 'experience_bottle', 'player_head',
       'diamond', 'emerald', 'gold_ingot', 'iron_ingot', 'raw_gold', 'raw_iron',
-      'coal', 'lapis_lazuli', 'redstone', 'netherite_scrap', 'netherite_ingot', 'ancient_debris'
+      'coal', 'lapis_lazuli', 'redstone', 'netherite_scrap', 'netherite_ingot', 'ancient_debris',
+      'tripwire_hook'
     ];
 
     const items = this.bot.inventory.items();
@@ -594,7 +595,6 @@ class MinecraftBot {
 
         // Если за 12 секунд ни одного блока не сломано — перезапуск итерации
         if (Date.now() - lastDigTime > 12000) {
-          console.log(`[MC ${this.username}] Idle 12s, restarting mineLoop iteration`);
           if (this.bot.pathfinder) this.bot.pathfinder.stop();
           this.bot.clearControlStates();
           try { this.bot.stopDigging(); } catch(_) {}
