@@ -499,14 +499,17 @@ class MinecraftBot {
 
     const bottles = this.bot.inventory.items().find(i => i.name === 'experience_bottle');
     if (!bottles) {
-      this.tg.sendMessage(`⚠️ [${this.username}] Кирка ломается, но нет пузырьков опыта! Шахта остановлена.`);
-      this.stopMiner();
-      return false;
+      // Нет пузырьков — продолжаем копать как есть
+      return true;
     }
 
     this.tg.sendMessage(`♻️ [${this.username}] Починка кирки (прочность: ${remaining})...`);
     
     try {
+      // Смотрим вниз чтобы пузырьки падали под ноги
+      await this.bot.look(this.bot.entity.yaw, Math.PI / 2, true);
+      await this.sleep(100);
+      
       await this.bot.equip(bottles, 'off-hand');
       while (this.isMining) {
         const currentHeld = this.bot.heldItem;
@@ -518,7 +521,7 @@ class MinecraftBot {
         const hasBottle = this.bot.inventory.slots[45] && this.bot.inventory.slots[45].name === 'experience_bottle';
         if (!hasBottle) {
            const moreBottles = this.bot.inventory.items().find(i => i.name === 'experience_bottle');
-           if (!moreBottles) break;
+           if (!moreBottles) break; // Пузырьки кончились — выходим, продолжаем копать
            await this.bot.equip(moreBottles, 'off-hand');
         }
 
@@ -539,7 +542,7 @@ class MinecraftBot {
       return true;
     } catch (err) {
       this.tg.sendMessage(`❌ [${this.username}] Ошибка починки: ${err.message}`);
-      return false;
+      return true; // Продолжаем копать даже при ошибке
     }
   }
 
@@ -555,6 +558,31 @@ class MinecraftBot {
 
     const targetBlocks = ['diamond_ore', 'emerald_ore', 'gold_ore', 'iron_ore', 'coal_ore', 'lapis_ore', 'redstone_ore', 'netherite_ore', 'ancient_debris'];
     const targetIds = targetBlocks.map(name => this.bot.registry.blocksByName[name]?.id).filter(id => id != null);
+
+    // Перехватываем bot.dig — если бот на лестнице, сначала зажимаем Shift, потом копаем
+    const originalDig = this.bot.dig.bind(this.bot);
+    this.bot.dig = async (block, forceLook, digFace) => {
+      const pos = this.bot.entity?.position;
+      if (!pos) return originalDig(block, forceLook, digFace);
+      
+      const blockAtFeet = this.bot.blockAt(pos);
+      const blockAtHead = this.bot.blockAt(pos.offset(0, 1, 0));
+      const onLadder = (blockAtFeet && (blockAtFeet.name.includes('ladder') || blockAtFeet.name.includes('vine'))) ||
+                        (blockAtHead && (blockAtHead.name.includes('ladder') || blockAtHead.name.includes('vine')));
+      
+      if (onLadder) {
+        this.bot.setControlState('sneak', true);
+        await this.sleep(150); // Дать время зафиксироваться
+      }
+      
+      try {
+        return await originalDig(block, forceLook, digFace);
+      } finally {
+        if (onLadder) {
+          this.bot.setControlState('sneak', false);
+        }
+      }
+    };
 
     while (this.isMining && this.bot && this.isConnected) {
       try {
@@ -607,12 +635,11 @@ class MinecraftBot {
         const navPromise = this.bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 3));
         navPromise.then(() => navDone = true).catch(() => navDone = true);
 
-        let ticks = 0;
-        let lastDist = botPos.distanceTo(targetPos);
+        let bestDist = botPos.distanceTo(targetPos);
+        let noProgressTicks = 0;
         
         while (!navDone && this.isMining) {
           await this.sleep(500);
-          ticks++;
           
           // Проверка починки на ходу
           const held = this.bot.heldItem;
@@ -624,22 +651,20 @@ class MinecraftBot {
             }
           }
           
-          // Проверка застревания (каждые 4 сек)
-          if (ticks % 8 === 0) {
-            const curDist = this.bot.entity.position.distanceTo(targetPos);
-            if (curDist >= lastDist - 0.5) {
+          // Проверка застревания
+          const curDist = this.bot.entity.position.distanceTo(targetPos);
+          if (curDist < bestDist - 0.2) {
+            bestDist = curDist;
+            noProgressTicks = 0;
+          } else {
+            noProgressTicks++;
+            if (noProgressTicks >= 8) { // 4 секунды без приближения
               if (this.bot.pathfinder) this.bot.pathfinder.stop();
               this.bot.clearControlStates();
-              
-              // Прыжок если зависли
-              this.bot.setControlState('jump', true);
-              setTimeout(() => this.bot.setControlState('jump', false), 250);
-              
               this.badBlocks.set(key, Date.now() + 15000);
               navDone = true;
               break;
             }
-            lastDist = curDist;
           }
         }
 
