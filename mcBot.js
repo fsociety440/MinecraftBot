@@ -33,6 +33,9 @@ class MinecraftBot {
     this.isMining = false;
     this.badBlocks = new Map();
 
+    this.invisEnabled = false;
+    this.lastInvisWarn = 0;
+
     this.isEating = false;
   }
 
@@ -43,6 +46,8 @@ class MinecraftBot {
   stop() {
     this.isConnected = false;
     this.stopFarm();
+    this.stopMiner();
+    if (this.invisEnabled) this.stopInvis();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.bot) {
       try { this.bot.quit(); } catch (_) {}
@@ -447,6 +452,73 @@ class MinecraftBot {
     if (this.bot && this.bot.pathfinder) this.bot.pathfinder.stop();
     if (this.bot) try { this.bot.stopDigging(); } catch (_) {}
     this.tg.sendMessage(`🛑 [${this.username}] Авто-Шахта ВЫКЛЮЧЕНА`);
+  }
+
+  // --- Invisibility ---
+
+  startInvis() {
+    if (this.invisEnabled) return;
+    this.invisEnabled = true;
+    this.tg.sendMessage(`👻 [${this.username}] Невидимость ВКЛЮЧЕНА (AFK Shift)`);
+    if (this.bot) this.bot.setControlState('sneak', true);
+    this.invisLoop();
+  }
+
+  stopInvis() {
+    this.invisEnabled = false;
+    if (this.bot) this.bot.setControlState('sneak', false);
+    this.tg.sendMessage(`🛑 [${this.username}] Невидимость ВЫКЛЮЧЕНА`);
+  }
+
+  async invisLoop() {
+    while (this.invisEnabled && this.bot && this.isConnected) {
+      try {
+        if (!this.bot.entity) { await this.sleep(1000); continue; }
+
+        // Постоянно поддерживаем нажатым Shift
+        if (!this.bot.controlState.sneak) {
+          this.bot.setControlState('sneak', true);
+        }
+
+        // Проверяем эффект невидимости (ID = 14)
+        let hasInvis = false;
+        if (this.bot.entity.effects) {
+          // В mineflayer effects — это объект { id: Effect, ... }
+          hasInvis = !!this.bot.entity.effects[14];
+        }
+
+        if (!hasInvis) {
+          // Ищем зелье невидимости
+          const potion = this.bot.inventory.items().find(i => 
+            i.name === 'potion' && 
+            i.nbt && 
+            i.nbt.value && 
+            i.nbt.value.Potion && 
+            i.nbt.value.Potion.value && 
+            i.nbt.value.Potion.value.includes('invisibility')
+          );
+
+          if (potion) {
+            this.tg.sendMessage(`🧪 [${this.username}] Пью зелье невидимости...`);
+            await this.bot.equip(potion, 'hand');
+            this.bot.activateItem();
+            await this.sleep(2000); // Питье занимает около 1.6 сек
+            this.bot.deactivateItem();
+            await this.sleep(500);
+          } else {
+            // Если зелий нет, пишем предупреждение (не чаще 1 раза в минуту)
+            if (Date.now() - this.lastInvisWarn > 60000) {
+              this.tg.sendMessage(`⚠️ [${this.username}] Эффект невидимости спал, а зелий в инвентаре НЕТ!`);
+              this.lastInvisWarn = Date.now();
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`[MC ${this.username}] invisLoop error:`, err);
+      }
+      
+      await this.sleep(2000);
+    }
   }
 
   async clearJunk() {
