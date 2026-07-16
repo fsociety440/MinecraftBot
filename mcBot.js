@@ -499,8 +499,10 @@ class MinecraftBot {
 
     const bottles = this.bot.inventory.items().find(i => i.name === 'experience_bottle');
     if (!bottles) {
-      // Нет пузырьков — продолжаем копать как есть
-      return true;
+      // Нет пузырьков и кирка почти сломана — стоп
+      this.tg.sendMessage(`⚠️ [${this.username}] Кирка ломается (${remaining}), но нет пузырьков опыта! Шахта остановлена.`);
+      this.stopMiner();
+      return false;
     }
 
     this.tg.sendMessage(`♻️ [${this.username}] Починка кирки (прочность: ${remaining})...`);
