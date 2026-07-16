@@ -1,5 +1,5 @@
 const mineflayer = require('mineflayer');
-const { pathfinder } = require('mineflayer-pathfinder');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const cfg = require('./config');
 const captcha = require('./captcha');
 
@@ -28,6 +28,10 @@ class MinecraftBot {
     this.monitorEnabled = false;
     this.monitorInterval = null;
     this.lastMonitorMsgId = null;
+
+    this.minerEnabled = false;
+    this.isMining = false;
+    this.badBlocks = new Map();
 
     this.isEating = false;
   }
@@ -185,26 +189,10 @@ class MinecraftBot {
 
     this.bot.on('windowOpen', (window) => {
       this.openWindow = window;
+      this.antibotCheckPassed = true;
+      this.bot.physicsEnabled = true;
       console.log(`[MC ${this.username}] windowOpen: "${window.title}"`);
-
-      const items = [];
-      for (let i = 0; i < window.slots.length; i++) {
-        const item = window.slots[i];
-        if (!item) continue;
-
-        let rawName = item.customName;
-        let name = this.extractJsonText(rawName);
-        if (!name.trim()) {
-          name = this.extractJsonText(item.displayName || item.name || `Item#${item.type}`);
-        }
-
-        const lore = (item.nbt?.value?.display?.value?.Lore?.value?.value || [])
-          .map(l => this.stripColorCodes(this.extractJsonText(l)));
-
-        items.push({ slot: i, name: this.stripColorCodes(name), lore });
-      }
-
-      this.tg.sendServerMenu(this, items);
+      this.sendCurrentWindowMenu();
     });
 
     this.bot.on('windowClose', () => {
@@ -263,6 +251,39 @@ class MinecraftBot {
 
   // --- Actions ---
 
+  sendCurrentWindowMenu() {
+    if (!this.openWindow) return;
+    if (this._menuTimeout) clearTimeout(this._menuTimeout);
+    
+    this._menuTimeout = setTimeout(() => {
+      if (!this.openWindow) return;
+      const window = this.openWindow;
+      const items = [];
+      for (let i = 0; i < window.slots.length; i++) {
+        const item = window.slots[i];
+        if (!item) continue;
+
+        let rawName = item.customName;
+        let name = this.extractJsonText(rawName);
+        if (!name.trim()) {
+          name = this.extractJsonText(item.displayName || item.name || `Item#${item.type}`);
+        }
+
+        const lore = (item.nbt?.value?.display?.value?.Lore?.value?.value || [])
+          .map(l => this.stripColorCodes(this.extractJsonText(l)));
+
+        items.push({ slot: i, name: this.stripColorCodes(name), lore });
+      }
+
+      // Проверка на дубликаты (чтобы не отправлять дважды одно и то же меню)
+      const menuHash = JSON.stringify(items);
+      if (this._lastMenuHash !== menuHash) {
+        this._lastMenuHash = menuHash;
+        this.tg.sendServerMenu(this, items);
+      }
+    }, 500); // Ждём 500мс после события, чтобы сервер успел прислать предметы
+  }
+
   async useCompass() {
     if (!this.bot || !this.isConnected) return;
     try {
@@ -287,9 +308,42 @@ class MinecraftBot {
       return;
     }
     try {
-      await this.bot.clickWindow(slotIndex, 0, 0);
-      this.tg.sendMessage(`👆 [${this.username}] Нажал на слот ${slotIndex}`);
+      let mouseButton = 0; // Default to Left Click
+      const item = this.openWindow.slots[slotIndex];
+      if (item) {
+        let name = this.extractJsonText(item.customName);
+        if (!name.trim()) name = this.extractJsonText(item.displayName || item.name || '');
+        
+        const lore = (item.nbt?.value?.display?.value?.Lore?.value?.value || [])
+          .map(l => this.extractJsonText(l)).join(' ');
+        
+        const fullText = (name + ' ' + lore).toLowerCase();
+        if (fullText.includes('пкм') || fullText.includes('правая') || fullText.includes('right click')) {
+          mouseButton = 1;
+        }
+      }
+
+      await this.bot.clickWindow(slotIndex, mouseButton, 0);
+      this.tg.sendMessage(`👆 [${this.username}] Нажал на слот ${slotIndex} (${mouseButton === 1 ? 'ПКМ' : 'ЛКМ'})`);
+
+      // Сервер может обновить содержимое текущего окна без отправки нового windowOpen.
+      // Ждём 1.5 секунды и отправляем обновлённое меню, если окно всё ещё открыто.
+      setTimeout(() => {
+        if (this.openWindow) {
+          this.sendCurrentWindowMenu();
+        }
+      }, 1500);
+
     } catch (err) {
+      if (err.message && err.message.includes("Server didn't respond to transaction for clicking on slot")) {
+        // Сервер часто не присылает подтверждение транзакции в кастомных меню, но клик проходит
+        setTimeout(() => {
+          if (this.openWindow) {
+            this.sendCurrentWindowMenu();
+          }
+        }, 1500);
+        return;
+      }
       this.tg.sendMessage(`❌ [${this.username}] Ошибка слота: ${err.message}`);
     }
   }
@@ -372,6 +426,245 @@ class MinecraftBot {
       this.bot.chat(text);
       this.tg.sendMessage(`💬 [${this.username}] Написал: ${text}`);
     } catch (e) {}
+  }
+
+  // --- Auto Miner ---
+
+  startMiner() {
+    this.antibotCheckPassed = true;
+    this.bot.physicsEnabled = true;
+    this.minerEnabled = true;
+    if (this.isMining) return;
+    this.isMining = true;
+    this.badBlocks.clear();
+    this.tg.sendMessage(`⛏ [${this.username}] Авто-Шахта ВКЛЮЧЕНА`);
+    this.mineLoop();
+  }
+
+  stopMiner() {
+    this.minerEnabled = false;
+    this.isMining = false;
+    if (this.bot && this.bot.pathfinder) this.bot.pathfinder.stop();
+    if (this.bot) try { this.bot.stopDigging(); } catch (_) {}
+    this.tg.sendMessage(`🛑 [${this.username}] Авто-Шахта ВЫКЛЮЧЕНА`);
+  }
+
+  async clearJunk() {
+    if (!this.bot || !this.bot.inventory) return;
+    if (this.bot.inventory.emptySlotCount() > 8) return; // Keep if >= 9 slots free
+
+    const keepItems = [
+      'netherite_pickaxe', 'diamond_pickaxe', 'experience_bottle', 'player_head',
+      'diamond', 'emerald', 'gold_ingot', 'iron_ingot', 'raw_gold', 'raw_iron',
+      'coal', 'lapis_lazuli', 'redstone', 'netherite_scrap', 'netherite_ingot', 'ancient_debris'
+    ];
+
+    const items = this.bot.inventory.items();
+    for (const item of items) {
+      if (!this.isMining) break;
+      if (!keepItems.includes(item.name)) {
+        try {
+          await this.bot.tossStack(item);
+          await this.sleep(200);
+        } catch (e) {}
+      }
+    }
+  }
+
+  async equipPickaxe() {
+    if (!this.bot || !this.bot.inventory) return false;
+    // Unequip pickaxe from off-hand if it's there
+    const offHand = this.bot.inventory.slots[45];
+    if (offHand && offHand.name.includes('pickaxe')) {
+      try { await this.bot.unequip('off-hand'); await this.sleep(200); } catch (_) {}
+    }
+    const tiers = ['netherite_pickaxe', 'diamond_pickaxe'];
+    for (const name of tiers) {
+      const pick = this.bot.inventory.items().find(i => i.name === name);
+      if (pick) {
+        try { await this.bot.equip(pick, 'hand'); return true; } catch (_) {}
+      }
+    }
+    const held = this.bot.heldItem;
+    return !!(held && tiers.includes(held.name));
+  }
+
+  async checkAndRepairPickaxe() {
+    if (!this.bot || !this.bot.inventory) return true;
+    const held = this.bot.heldItem;
+    if (!held || !held.name.includes('pickaxe') || held.durabilityUsed === undefined) return true;
+    
+    const remaining = held.maxDurability - held.durabilityUsed;
+    if (remaining > 100) return true;
+
+    const bottles = this.bot.inventory.items().find(i => i.name === 'experience_bottle');
+    if (!bottles) {
+      this.tg.sendMessage(`⚠️ [${this.username}] Кирка ломается, но нет пузырьков опыта! Шахта остановлена.`);
+      this.stopMiner();
+      return false;
+    }
+
+    this.tg.sendMessage(`♻️ [${this.username}] Починка кирки (прочность: ${remaining})...`);
+    
+    try {
+      await this.bot.equip(bottles, 'off-hand');
+      while (this.isMining) {
+        const currentHeld = this.bot.heldItem;
+        if (!currentHeld || !currentHeld.name.includes('pickaxe')) break; // Кирка пропала
+        
+        const currentRemaining = currentHeld.maxDurability - currentHeld.durabilityUsed;
+        if (currentRemaining > currentHeld.maxDurability - 20) break; // Починили
+
+        const hasBottle = this.bot.inventory.slots[45] && this.bot.inventory.slots[45].name === 'experience_bottle';
+        if (!hasBottle) {
+           const moreBottles = this.bot.inventory.items().find(i => i.name === 'experience_bottle');
+           if (!moreBottles) break;
+           await this.bot.equip(moreBottles, 'off-hand');
+        }
+
+        this.bot.activateItem(true); // Right click with off-hand
+        await this.sleep(200);
+      }
+      this.bot.deactivateItem();
+      
+      // Возвращаем сферу (голову) в левую руку
+      const head = this.bot.inventory.items().find(i => i.name === 'player_head');
+      if (head) {
+        try { await this.bot.equip(head, 'off-hand'); } catch (_) {}
+      } else {
+        try { await this.bot.unequip('off-hand'); } catch (_) {}
+      }
+      
+      this.tg.sendMessage(`✅ [${this.username}] Кирка починена!`);
+      return true;
+    } catch (err) {
+      this.tg.sendMessage(`❌ [${this.username}] Ошибка починки: ${err.message}`);
+      return false;
+    }
+  }
+
+  async mineLoop() {
+    const mcData = require('minecraft-data')(this.bot.version);
+    const move = new Movements(this.bot, mcData);
+    move.allowFreeFall = true;
+    move.canDig = true; // Бот будет сам прокапывать путь
+    move.allow1by1towers = false;
+    move.maxDropDown = 6;
+    move.scafoldingBlocks = [];
+    this.bot.pathfinder.setMovements(move);
+
+    const targetBlocks = ['diamond_ore', 'emerald_ore', 'gold_ore', 'iron_ore', 'coal_ore', 'lapis_ore', 'redstone_ore', 'netherite_ore', 'ancient_debris'];
+    const targetIds = targetBlocks.map(name => this.bot.registry.blocksByName[name]?.id).filter(id => id != null);
+
+    while (this.isMining && this.bot && this.isConnected) {
+      try {
+        if (!this.bot.entity || !this.bot.entity.position) { await this.sleep(1000); continue; }
+
+        this.bot.clearControlStates();
+        await this.clearJunk();
+        if (!this.isMining) break;
+
+        const hasPick = await this.equipPickaxe();
+        if (!hasPick) {
+          this.tg.sendMessage(`❌ [${this.username}] Нет алмазной/незеритовой кирки!`);
+          this.stopMiner();
+          break;
+        }
+
+        const repaired = await this.checkAndRepairPickaxe();
+        if (!repaired) break;
+
+        // Поиск руды
+        const botPos = this.bot.entity.position;
+        let found = this.bot.findBlocks({ matching: targetIds, maxDistance: 32, count: 128 });
+        
+        const now = Date.now();
+        for (const [k, exp] of this.badBlocks) {
+          if (now > exp) this.badBlocks.delete(k);
+        }
+        
+        found = found.filter(pos => !this.badBlocks.has(`${pos.x},${pos.y},${pos.z}`));
+        if (found.length === 0) {
+          await this.sleep(1000);
+          continue;
+        }
+
+        found.sort((a, b) => botPos.distanceTo(a) - botPos.distanceTo(b));
+        const targetPos = found[0];
+        const key = `${targetPos.x},${targetPos.y},${targetPos.z}`;
+
+        // Берем голову в левую руку
+        const offHand = this.bot.inventory.slots[45];
+        if (!offHand || offHand.name !== 'player_head') {
+          const head = this.bot.inventory.items().find(i => i.name === 'player_head');
+          if (head) {
+            try { await this.bot.equip(head, 'off-hand'); } catch (_) {}
+          }
+        }
+
+        // Подход к блоку (патфайндер будет прокапывать путь)
+        let navDone = false;
+        const navPromise = this.bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 3));
+        navPromise.then(() => navDone = true).catch(() => navDone = true);
+
+        let ticks = 0;
+        let lastDist = botPos.distanceTo(targetPos);
+        
+        while (!navDone && this.isMining) {
+          await this.sleep(500);
+          ticks++;
+          
+          // Проверка починки на ходу
+          const held = this.bot.heldItem;
+          if (held && held.name.includes('pickaxe') && held.durabilityUsed !== undefined) {
+            if (held.maxDurability - held.durabilityUsed < 100) {
+              if (this.bot.pathfinder) this.bot.pathfinder.stop();
+              navDone = true;
+              break;
+            }
+          }
+          
+          // Проверка застревания (каждые 4 сек)
+          if (ticks % 8 === 0) {
+            const curDist = this.bot.entity.position.distanceTo(targetPos);
+            if (curDist >= lastDist - 0.5) {
+              if (this.bot.pathfinder) this.bot.pathfinder.stop();
+              this.bot.clearControlStates();
+              
+              // Прыжок если зависли
+              this.bot.setControlState('jump', true);
+              setTimeout(() => this.bot.setControlState('jump', false), 250);
+              
+              this.badBlocks.set(key, Date.now() + 15000);
+              navDone = true;
+              break;
+            }
+            lastDist = curDist;
+          }
+        }
+
+        if (!this.isMining) break;
+
+        const dist = this.bot.entity.position.distanceTo(targetPos);
+        if (dist <= 5.5) {
+          const block = this.bot.blockAt(targetPos);
+          if (block && block.type !== 0 && block.name !== 'air' && block.name !== 'cave_air') {
+            try {
+              await this.bot.dig(block, true);
+            } catch (err) {
+              try { this.bot.stopDigging(); } catch(_) {}
+              this.badBlocks.set(key, Date.now() + 15000);
+            }
+          }
+        } else {
+          this.badBlocks.set(key, Date.now() + 15000);
+        }
+
+      } catch (err) {
+        console.error(`[MC ${this.username}] mineLoop error:`, err);
+        await this.sleep(1000);
+      }
+    }
   }
 
   // --- Utils ---

@@ -232,7 +232,7 @@ class TelegramManager {
     const text = `🤖 *Бот:* ${this.escapeMarkdown(bot.username)}\n🌐 *Сервер:* ${this.escapeMarkdown(bot.host)}:${bot.port}\n📶 *Статус:* ${bot.isConnected ? '✅ Онлайн' : '❌ Оффлайн'}\n⚔️ *Фарм:* ${bot.farmInterval ? 'ВКЛ' : 'ВЫКЛ'}`;
     
     const keyboard = [
-      [{ text: bot.farmInterval ? '🛑 Выкл Фарм' : '⚔️ Вкл Фарм' }, { text: '🧭 Компас' }, { text: '🍎 Покушать' }],
+      [{ text: bot.farmInterval ? '🛑 Выкл Фарм' : '⚔️ Вкл Фарм' }, { text: bot.minerEnabled ? '🛑 Выкл Шахта' : '⛏ Вкл Шахта' }, { text: '🧭 Компас' }, { text: '🍎 Покушать' }],
       [{ text: '🎒 Слоты' }, { text: '👁 Взгляд' }, { text: '💬 Чат' }],
       [{ text: '🔄 Реконнект' }, { text: '🗑 Удалить' }, { text: '⬅️ Назад к списку' }]
     ];
@@ -308,6 +308,11 @@ class TelegramManager {
       
       if (text === '⚔️ Вкл Фарм' || text === '🛑 Выкл Фарм') {
         bot.farmInterval ? bot.stopFarm() : bot.startFarm();
+        this.showBotMenu(this.activeBotId);
+        return;
+      }
+      if (text === '⛏ Вкл Шахта' || text === '🛑 Выкл Шахта') {
+        bot.minerEnabled ? bot.stopMiner() : bot.startMiner();
         this.showBotMenu(this.activeBotId);
         return;
       }
