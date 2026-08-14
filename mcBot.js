@@ -20,8 +20,11 @@ class MinecraftBot {
     this.bot = null;
     this.farmInterval = null;
     this.reconnectTimer = null;
-    this.isConnected = false;
-    this.openWindow = null;
+    this.autoEatInterval = null;
+    this.invisEnabled = false;
+    this.macroSequence = [];
+    this.macroEnabled = false;
+    
     this.antibotCheckPassed = false;
     
     // Auto-monitor
@@ -33,7 +36,6 @@ class MinecraftBot {
     this.isMining = false;
     this.badBlocks = new Map();
 
-    this.invisEnabled = false;
     this.lastInvisWarn = 0;
 
     this.isEating = false;
@@ -47,6 +49,7 @@ class MinecraftBot {
     this.isConnected = false;
     this.stopFarm();
     this.stopMiner();
+    this.stopAutoEat();
     if (this.invisEnabled) this.stopInvis();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.bot) {
@@ -64,6 +67,14 @@ class MinecraftBot {
       this.tg.sendMessage(`🔄 [${this.username}] Переподключаюсь…`);
       this.createBot();
     }, cfg.RECONNECT_DELAY_MS);
+  }
+
+  connectNow() {
+    this.stopFarm();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.tg.sendMessage(`🔄 [${this.username}] Подключение...`);
+    this.createBot();
   }
 
   createBot() {
@@ -88,25 +99,29 @@ class MinecraftBot {
       console.warn(`[MC ${this.username} RAW kick_disconnect]`, JSON.stringify(packet));
     });
 
-    this.bot._client.on('position', (packet) => {
-      if (packet.teleportId !== undefined) {
-        this.bot._client.write('teleport_confirm', { teleportId: packet.teleportId });
-      }
-    });
-
+    // Removed custom teleport_confirm to prevent infinite loops on Bungee
     this.bot.loadPlugin(pathfinder);
 
     this.bot.once('spawn', () => {
       this.antibotCheckPassed = false;
       console.log(`[MC ${this.username}] Spawned!`);
+      if (this.macroEnabled && this.macroSequence && this.macroSequence.length > 0) {
+        setTimeout(() => {
+          this.executeMacro();
+        }, 3000); // Wait 3 seconds after spawn
+      }
     });
 
-    this.bot.on('login', () => {
+    this.bot.once('login', () => {
+      const isFirstLogin = !this.isConnected;
       this.isConnected = true;
+      if (isFirstLogin) {
+        if (this.tg.activeBotId === this.id) this.tg.showBotMenu(this.id);
+        this.tg.sendMessage(`✅ Бот *${this.escapeMarkdown(this.username)}* зашел на сервер \n\`${this.host}:${this.port}\``, {
+          parse_mode: 'Markdown',
+        });
+      }
       console.log(`[MC ${this.username}] Login. Applying physics bypass hooks...`);
-      this.tg.sendMessage(`✅ Бот *${this.escapeMarkdown(this.username)}* вошёл на сервер \`${this.host}:${this.port}\``, {
-        parse_mode: 'Markdown',
-      });
       
       captcha.initMapListener(this.bot);
       this.bot.physicsEnabled = true;
@@ -215,6 +230,15 @@ class MinecraftBot {
       const text = jsonMsg.toString();
       const lower = text.toLowerCase();
       
+      if (
+        lower.includes('уважаемый игрок') ||
+        lower.includes('vk.me') ||
+        lower.includes('привяжите свой аккаунт') ||
+        lower.includes('бесплатно восстанавливать пароль')
+      ) {
+        return; // Игнорируем рекламу привязки ВК
+      }
+
       const checkPassedPhrases = ['проверка пройдена', 'успешно пройдена', 'спасибо за подтверждение', 'вы успешно прошли проверку', 'добро пожаловать', 'вы прошли', 'welcome', 'verification passed', 'check passed', 'успешно', 'авторизуйтесь', '/login', '/reg', 'пароль'];
       const isCheckPassed = checkPassedPhrases.some(p => lower.includes(p));
 
@@ -245,6 +269,7 @@ class MinecraftBot {
     this.bot.on('end', (reason) => {
       if (!this.isConnected) return;
       this.isConnected = false;
+      if (this.tg.activeBotId === this.id) this.tg.showBotMenu(this.id);
       this.tg.sendMessage(`🔌 [${this.username}] Отключен: ${reason}`);
       this.scheduleReconnect();
     });
@@ -290,11 +315,11 @@ class MinecraftBot {
   }
 
   async useCompass() {
-    if (!this.bot || !this.isConnected) return;
+    if (!this.bot) return;
     try {
       const compass = this.bot.inventory.items().find(item => item.name === 'compass');
       if (!compass) {
-        this.tg.sendMessage(`🧭 [${this.username}] В инвентаре нет компаса.`);
+        this.tg.sendMessage(`⚠️ [${this.username}] В инвентаре нет компаса.`);
         return;
       }
       await this.bot.equip(compass, 'hand');
@@ -306,8 +331,35 @@ class MinecraftBot {
     }
   }
 
+  async executeMacro() {
+    if (!this.bot) return;
+    this.tg.sendMessage(`🤖 [${this.username}] Выполняю макрос...`);
+    
+    // First, use compass
+    const compass = this.bot.inventory.items().find(item => item.name === 'compass');
+    if (compass) {
+      try {
+        await this.bot.equip(compass, 'hand');
+        await this.sleep(500);
+        this.bot.activateItem();
+        await this.sleep(2000); // Ждем 2 сек, пока откроется меню компаса
+      } catch(e) {}
+    } else {
+      this.tg.sendMessage(`⚠️ [${this.username}] Нет компаса для макроса, продолжаю...`);
+    }
+
+    // Loop through slots
+    for (const slot of this.macroSequence) {
+      if (!this.bot) break;
+      this.tg.sendMessage(`🤖 [${this.username}] Макрос: клик слота ${slot}...`);
+      await this.clickSlot(slot);
+      await this.sleep(1500); // Задержка между кликами
+    }
+    this.tg.sendMessage(`🤖 [${this.username}] Макрос завершен.`);
+  }
+
   async clickSlot(slotIndex) {
-    if (!this.bot || !this.isConnected) return;
+    if (!this.bot) return;
     if (!this.openWindow) {
       this.tg.sendMessage(`❌ [${this.username}] Нет открытого окна`);
       return;
@@ -356,10 +408,19 @@ class MinecraftBot {
   startFarm() {
     if (this.farmInterval) return;
     this.farmInterval = setInterval(() => {
-      if (!this.bot || !this.isConnected) return;
-      try { this.bot.swingArm('left'); } catch (_) {}
+      if (!this.bot || !this.isConnected || !this.bot.entity) return;
+      try {
+        // Проверяем сущность строго в перекрестии прицела (как обычный автокликер)
+        const target = this.bot.entityAtCursor(4.0);
+        
+        if (target && (target.type === 'mob' || target.type === 'animal' || (target.type === 'player' && target.username !== this.bot.username))) {
+          this.bot.attack(target);
+        } else {
+          this.bot.swingArm('right');
+        }
+      } catch (_) {}
     }, cfg.FARM_INTERVAL_MS);
-    this.tg.sendMessage(`⚔️ [${this.username}] Фарм Включен`);
+    this.tg.sendMessage(`⚔️ [${this.username}] Фарм Включен (автокликер перед собой)`);
   }
 
   stopFarm() {
@@ -371,7 +432,7 @@ class MinecraftBot {
   }
 
   async eatItem() {
-    if (!this.bot || !this.isConnected) return;
+    if (!this.bot) return;
     this.tg.sendMessage(`🍎 [${this.username}] Кушаю предмет из левой руки...`);
     try {
       this.bot.activateItem(true); 
@@ -382,8 +443,34 @@ class MinecraftBot {
     }
   }
 
+  startAutoEat() {
+    if (this.autoEatInterval) return;
+    let isEating = false;
+    this.autoEatInterval = setInterval(async () => {
+      if (!this.bot || !this.isConnected || isEating) return;
+      if (this.bot.food < 18) {
+        isEating = true;
+        try {
+          this.bot.activateItem(true); 
+          await this.sleep(2000);
+          this.bot.deactivateItem();
+        } catch (_) {}
+        isEating = false;
+      }
+    }, 3000);
+    this.tg.sendMessage(`🍔 [${this.username}] Авто-Еда Включена (кушает при сытости < 18)`);
+  }
+
+  stopAutoEat() {
+    if (this.autoEatInterval) {
+      clearInterval(this.autoEatInterval);
+      this.autoEatInterval = null;
+      this.tg.sendMessage(`🛑 [${this.username}] Авто-Еда Выключена`);
+    }
+  }
+
   setSlot(slotIndex) {
-    if (!this.bot || !this.isConnected) return;
+    if (!this.bot) return;
     try {
       // hotbar is 0-8 in mineflayer
       this.bot.setQuickBarSlot(slotIndex);
@@ -394,7 +481,7 @@ class MinecraftBot {
   }
 
   async equipOffHand() {
-    if (!this.bot || !this.isConnected) return;
+    if (!this.bot) return;
     try {
       const item = this.bot.heldItem;
       if (!item) {
@@ -419,14 +506,14 @@ class MinecraftBot {
   }
 
   lookAt(yaw, pitch) {
-    if (!this.bot || !this.isConnected) return;
+    if (!this.bot) return;
     try {
       this.bot.look(yaw, pitch, true);
     } catch (e) {}
   }
 
   sendToChat(text) {
-    if (!this.bot || !this.isConnected) return;
+    if (!this.bot) return;
     try {
       this.bot.chat(text);
       this.tg.sendMessage(`💬 [${this.username}] Написал: ${text}`);

@@ -41,7 +41,7 @@ class TelegramManager {
   saveBots() {
     const data = [];
     for (const bot of this.bots.values()) {
-      data.push({ username: bot.username, host: bot.host, port: bot.port });
+      data.push({ username: bot.username, host: bot.host, port: bot.port, macroSequence: bot.macroSequence, macroEnabled: bot.macroEnabled });
     }
     fs.writeFileSync(BOTS_FILE, JSON.stringify(data, null, 2));
   }
@@ -51,7 +51,7 @@ class TelegramManager {
       try {
         const data = JSON.parse(fs.readFileSync(BOTS_FILE, 'utf8'));
         for (const b of data) {
-          if (this.onAddBot) this.onAddBot(b.username, b.host, b.port);
+          if (this.onAddBot) this.onAddBot(b.username, b.host, b.port, false, b.macroSequence, b.macroEnabled);
         }
       } catch (e) {
         console.error('[TG] Failed to load bots:', e);
@@ -152,6 +152,9 @@ class TelegramManager {
       return;
     }
 
+
+
+
     if (enabled && !this.globalMonitorInterval) {
       this.showMainMenu();
       this.globalMonitorInterval = setInterval(async () => {
@@ -229,12 +232,14 @@ class TelegramManager {
 
     this.activeBotId = botId;
 
-    const text = `🤖 *Бот:* ${this.escapeMarkdown(bot.username)}\n🌐 *Сервер:* ${this.escapeMarkdown(bot.host)}:${bot.port}\n📶 *Статус:* ${bot.isConnected ? '✅ Онлайн' : '❌ Оффлайн'}\n⚔️ *Фарм:* ${bot.farmInterval ? 'ВКЛ' : 'ВЫКЛ'}`;
+    const text = `🤖 *Бот:* ${this.escapeMarkdown(bot.username)}\n🌐 *Сервер:* ${this.escapeMarkdown(bot.host)}:${bot.port}\n📶 *Статус:* ${bot.isConnected ? '✅ Онлайн' : '❌ Оффлайн'}\n⚔️ *Фарм:* ${bot.farmInterval ? 'ВКЛ' : 'ВЫКЛ'}\n🍔 *Еда:* ${bot.autoEatInterval ? 'ВКЛ' : 'ВЫКЛ'}`;
     
     const keyboard = [
+      [{ text: bot.isConnected ? '🔴 Отключиться' : '🟢 Подключиться' }],
       [{ text: bot.farmInterval ? '🛑 Выкл Фарм' : '⚔️ Вкл Фарм' }, { text: bot.minerEnabled ? '🛑 Выкл Шахта' : '⛏ Вкл Шахта' }, { text: bot.invisEnabled ? '🛑 Выкл Инвиз' : '👻 Вкл Инвиз' }],
-      [{ text: '🧭 Компас' }, { text: '🍎 Покушать' }, { text: '🎒 Слоты' }, { text: '👁 Взгляд' }],
-      [{ text: '💬 Чат' }, { text: '🔄 Реконнект' }, { text: '🗑 Удалить' }, { text: '⬅️ Назад к списку' }]
+      [{ text: '🧭 Компас' }, { text: bot.autoEatInterval ? '🛑 Выкл ЕДА' : '🍎 Вкл ЕДА' }, { text: '🎒 Слоты' }, { text: '👁 Взгляд' }],
+      [{ text: '🤖 Макросы' }, { text: '💬 Чат' }],
+      [{ text: '🗑 Удалить' }, { text: '⬅️ Назад к списку' }]
     ];
 
     this.sendMessage(text, { 
@@ -263,6 +268,26 @@ class TelegramManager {
     });
   }
 
+  showMacroMenu(botId) {
+    const bot = this.bots.get(botId);
+    if (!bot) return;
+    this.activeBotId = botId;
+
+    const seqStr = bot.macroSequence && bot.macroSequence.length > 0 ? bot.macroSequence.join(', ') : 'Пусто';
+    const text = `🤖 *Макросы бота ${this.escapeMarkdown(bot.username)}*\n\nТекущая последовательность: \`Компас\` -> \`${seqStr}\`\nСтатус макроса: ${bot.macroEnabled ? '✅ ВКЛ' : '❌ ВЫКЛ'}`;
+
+    const keyboard = [
+      [{ text: '📝 Создать макрос' }, { text: '🗑 Удалить макрос' }],
+      [{ text: bot.macroEnabled ? 'ВЫКЛ Макрос' : 'ВКЛ Макрос' }],
+      [{ text: '⬅️ Назад к боту' }]
+    ];
+
+    this.sendMessage(text, {
+      parse_mode: 'Markdown',
+      reply_markup: { keyboard, resize_keyboard: true, is_persistent: true }
+    });
+  }
+
 
   // --- Event Handlers ---
 
@@ -273,6 +298,84 @@ class TelegramManager {
     if (text === '/menu' || text === '/start' || text === '⬅️ Назад в Главное меню') {
       this.showMainMenu();
       return;
+    }
+
+    if (this.userState) {
+      if (this.userState.action === 'CREATE_MACRO') {
+        const bot = this.bots.get(this.userState.botId);
+        if (bot) {
+          const matches = text.match(/\d+/g);
+          if (matches) {
+            bot.macroSequence = matches.map(n => parseInt(n, 10));
+            bot.macroEnabled = true;
+            this.saveBots();
+            this.sendMessage('✅ Макрос сохранен и включен!');
+          } else {
+            bot.macroSequence = [];
+            this.saveBots();
+            this.sendMessage('⚠️ Не найдено чисел, макрос очищен.');
+          }
+          this.userState = null;
+          this.showMacroMenu(bot.id);
+        }
+        return;
+      }
+      if (this.userState.action === 'ADD_BOT_NAME') {
+        const name = text.split(' ')[0];
+        this.userState = { action: 'ADD_BOT_IP', name };
+        this.sendMessage('Никнейм: ' + name + '\nТеперь отправьте IP сервера (например: 127.0.0.1 25565 или просто 127.0.0.1):');
+        return;
+      }
+      if (this.userState.action === 'ADD_BOT_IP') {
+        const parts = text.split(' ');
+        const host = parts[0];
+        const port = parseInt(parts[1] || '25565', 10);
+        const name = this.userState.name;
+        this.userState = null;
+        this.sendMessage('⏳ Запускаю бота ' + name + ' на ' + host + ':' + port + '...');
+        if (this.onAddBot) this.onAddBot(name, host, port, true);
+        this.showMainMenu();
+        return;
+      }
+      if (this.userState.action === 'CAPTCHA') {
+        const bot = this.bots.get(this.userState.botId);
+        this.userState = null;
+        if (bot) {
+          bot.sendToChat(text);
+          this.sendMessage('✅ [' + bot.username + '] Капча отправлена: ' + text);
+        }
+        return;
+      }
+      if (this.userState.action === 'LOOK') {
+        const bot = this.bots.get(this.userState.botId);
+        if (bot) {
+          const match = text.match(/([\d.-]+)\s*\/\s*([\d.-]+)/);
+          if (match) {
+            const mcYaw = parseFloat(match[1]);
+            const mcPitch = parseFloat(match[2]);
+            const yaw = mcYaw * (Math.PI / 180);
+            const pitch = mcPitch * (Math.PI / 180);
+            bot.lookAt(yaw, pitch);
+            this.sendMessage('👁 [' + bot.username + '] Взгляд направлен (yaw=' + mcYaw + ', pitch=' + mcPitch + ')');
+          } else {
+            this.sendMessage('❌ Неверный формат. Ожидалось число/число (например: 123.4 / 56.7)', { parse_mode: 'Markdown' });
+          }
+        }
+        this.userState = null;
+        return;
+      }
+      if (this.userState.action === 'CHAT') {
+        const bot = this.bots.get(this.userState.botId);
+        if (text === '/stopchat') {
+           this.userState = null;
+           this.sendMessage('Чат отключен.');
+           return;
+        }
+        if (bot) {
+          bot.sendToChat(text);
+        }
+        return;
+      }
     }
 
     if (text === '➕ Добавить бота') {
@@ -291,7 +394,6 @@ class TelegramManager {
       return;
     }
 
-    // Если кликнули на бота в списке
     if (text.startsWith('🎮 ')) {
       const username = text.substring(3);
       for (const [id, bot] of this.bots.entries()) {
@@ -302,7 +404,6 @@ class TelegramManager {
       }
     }
 
-    // Reply Keyboard Handler for active bot
     if (this.activeBotId && this.bots.has(this.activeBotId)) {
       const bot = this.bots.get(this.activeBotId);
       
@@ -321,22 +422,59 @@ class TelegramManager {
         this.showBotMenu(this.activeBotId);
         return;
       }
+      if (text === '🍎 Вкл ЕДА' || text === '🛑 Выкл ЕДА') {
+        bot.autoEatInterval ? bot.stopAutoEat() : bot.startAutoEat();
+        this.showBotMenu(this.activeBotId);
+        return;
+      }
       if (text === '🧭 Компас') { bot.useCompass(); return; }
-      if (text === '🍎 Покушать') { bot.eatItem(); return; }
       if (text === '🎒 Слоты') { this.showSlotsMenu(this.activeBotId); return; }
       if (text === '⬅️ В левую руку') { bot.equipOffHand(); return; }
       if (text === '⬅️ Назад к боту') { this.showBotMenu(this.activeBotId); return; }
+      if (text === '🤖 Макросы') { this.showMacroMenu(this.activeBotId); return; }
+      if (text === '🗑 Удалить макрос') { 
+        bot.macroSequence = []; 
+        this.saveBots();
+        this.sendMessage('🗑 Макрос удален для ' + bot.username);
+        this.showMacroMenu(this.activeBotId);
+        return; 
+      }
+      if (text === 'ВКЛ Макрос' || text === 'ВЫКЛ Макрос') {
+        bot.macroEnabled = !bot.macroEnabled;
+        this.saveBots();
+        this.showMacroMenu(this.activeBotId);
+        return;
+      }
+      if (text === '📝 Создать макрос') {
+        this.userState = { action: 'CREATE_MACRO', botId: this.activeBotId };
+        this.sendMessage('✏️ Введите номера слотов через пробел или запятую.\nНапример: 12 15 4\n\n(При выполнении бот всегда сначала использует компас, а затем прокликает эти слоты.)');
+        return;
+      }
       if (text === '👁 Взгляд') {
         this.userState = { action: 'LOOK', botId: this.activeBotId };
-        this.sendMessage(`👁 *Управление взглядом*\nСкопируйте строчку Facing из F3...`, { parse_mode: 'Markdown' });
+        this.sendMessage('👁 Управление взглядом\nСкопируйте строчку Facing из F3...');
         return;
       }
       if (text === '💬 Чат') {
         this.userState = { action: 'CHAT', botId: this.activeBotId };
-        this.sendMessage(`💬 Режим чата для ${bot.username} активирован.\nНапишите /stopchat для выхода.`);
+        this.sendMessage('💬 Режим чата для ' + bot.username + ' активирован.\nНапишите /stopchat для выхода.');
         return;
       }
-      if (text === '🔄 Реконнект') { bot.scheduleReconnect(); return; }
+      if (text === '🔴 Отключиться') {
+        bot.stop();
+        this.sendMessage('🔌 [' + bot.username + '] Бот отключен от сервера.');
+        this.showBotMenu(this.activeBotId);
+        return;
+      }
+      if (text === '🟢 Подключиться') {
+        if (!bot.bot || !bot.isConnected) {
+          bot.connectNow();
+          this.showBotMenu(this.activeBotId);
+        } else {
+          this.sendMessage('⚠️ [' + bot.username + '] Бот уже в сети!');
+        }
+        return;
+      }
       if (text === '🗑 Удалить') { 
         this.removeBot(this.activeBotId);
         this.activeBotId = null;
@@ -350,11 +488,10 @@ class TelegramManager {
       }
     }
 
-    // Глобальные команды (отправляют во все боты сразу)
     if (text.startsWith('/say ') || text.startsWith('/login ') || text.startsWith('/register ') || text.startsWith('/reg ') || text.startsWith('/l ')) {
       let msgToSend = text;
       if (text.startsWith('/say ')) {
-        msgToSend = text.substring(5); // убираем "/say "
+        msgToSend = text.substring(5);
       }
       let count = 0;
       for (const bot of this.bots.values()) {
@@ -363,76 +500,8 @@ class TelegramManager {
           count++;
         }
       }
-      this.sendMessage(`📢 Отправлено в чат ${count} ботам.`);
+      this.sendMessage('📢 Отправлено в чат ' + count + ' ботам.');
       return;
-    }
-
-    if (this.userState) {
-      if (this.userState.action === 'ADD_BOT_NAME') {
-        const name = text.split(' ')[0];
-        this.userState = { action: 'ADD_BOT_IP', name };
-        this.sendMessage(`Никнейм: ${name}\nТеперь отправьте IP сервера (например: 127.0.0.1 25565 или просто 127.0.0.1):`);
-        return;
-      }
-
-      if (this.userState.action === 'ADD_BOT_IP') {
-        const parts = text.split(' ');
-        const host = parts[0];
-        const port = parseInt(parts[1] || '25565', 10);
-        const name = this.userState.name;
-        
-        this.userState = null;
-        this.sendMessage(`⏳ Запускаю бота ${name} на ${host}:${port}...`);
-        
-        if (this.onAddBot) {
-          this.onAddBot(name, host, port);
-        }
-        return;
-      }
-
-      if (this.userState.action === 'CAPTCHA') {
-        const bot = this.bots.get(this.userState.botId);
-        this.userState = null; // reset state
-        if (bot) {
-          bot.sendToChat(text);
-          this.sendMessage(`✅ [${bot.username}] Капча отправлена: ${text}`);
-        }
-        return;
-      }
-
-      if (this.userState.action === 'LOOK') {
-        const bot = this.bots.get(this.userState.botId);
-        if (bot) {
-          // Обрабатываем формат из F3, например "-90.0 / 12.5" или "120/45"
-          const match = text.match(/([\d.-]+)\s*\/\s*([\d.-]+)/);
-          if (match) {
-            const mcYaw = parseFloat(match[1]);
-            const mcPitch = parseFloat(match[2]);
-            // Перевод из градусов майнкрафта в радианы Mineflayer:
-            const yaw = mcYaw * (Math.PI / 180);
-            const pitch = mcPitch * (Math.PI / 180);
-            bot.lookAt(yaw, pitch);
-            this.sendMessage(`👁 [${bot.username}] Взгляд направлен (yaw=${mcYaw}, pitch=${mcPitch})`);
-          } else {
-            this.sendMessage('❌ Неверный формат. Ожидалось число/число (например: `123.4 / 56.7`)', { parse_mode: 'Markdown' });
-          }
-        }
-        this.userState = null;
-        return;
-      }
-
-      if (this.userState.action === 'CHAT') {
-        const bot = this.bots.get(this.userState.botId);
-        if (text === '/stopchat') {
-           this.userState = null;
-           this.sendMessage('Чат отключен.');
-           return;
-        }
-        if (bot) {
-          bot.sendToChat(text);
-        }
-        return;
-      }
     }
   }
 
@@ -519,7 +588,7 @@ class TelegramManager {
   }
 
   escapeMarkdown(text) {
-    return String(text).replace(/([_*[\]()~`>#+=|{}.!-])/g, '\\$1');
+    return String(text).replace(/([_*\[\]()~`])/g, '\\$1');
   }
 }
 
