@@ -15,6 +15,10 @@ class TelegramManager {
     this.globalMonitorEnabled = false;
     this.globalMonitorInterval = null;
     this.globalMonitorMsgId = null;
+
+    this.masterName = null;
+    this.radarEnabled = false;
+    this.whitelist = [];
   }
 
   init() {
@@ -39,18 +43,31 @@ class TelegramManager {
   }
 
   saveBots() {
-    const data = [];
+    const botsArray = [];
     for (const bot of this.bots.values()) {
-      data.push({ username: bot.username, host: bot.host, port: bot.port, macroSequence: bot.macroSequence, macroEnabled: bot.macroEnabled });
+      botsArray.push({ username: bot.username, host: bot.host, port: bot.port, macroSequence: bot.macroSequence, macroEnabled: bot.macroEnabled });
     }
+    const data = {
+      masterName: this.masterName,
+      radarEnabled: this.radarEnabled,
+      whitelist: this.whitelist,
+      bots: botsArray
+    };
     fs.writeFileSync(BOTS_FILE, JSON.stringify(data, null, 2));
   }
 
   loadBots() {
     if (fs.existsSync(BOTS_FILE)) {
       try {
-        const data = JSON.parse(fs.readFileSync(BOTS_FILE, 'utf8'));
-        for (const b of data) {
+        const raw = JSON.parse(fs.readFileSync(BOTS_FILE, 'utf8'));
+        let botsData = raw;
+        if (!Array.isArray(raw)) {
+          this.masterName = raw.masterName || null;
+          this.radarEnabled = raw.radarEnabled || false;
+          this.whitelist = raw.whitelist || [];
+          botsData = raw.bots || [];
+        }
+        for (const b of botsData) {
           if (this.onAddBot) this.onAddBot(b.username, b.host, b.port, false, b.macroSequence, b.macroEnabled);
         }
       } catch (e) {
@@ -147,6 +164,13 @@ class TelegramManager {
     if (!enabled && this.globalMonitorInterval) {
       clearInterval(this.globalMonitorInterval);
       this.globalMonitorInterval = null;
+      if (this.globalMonitorMsgId) {
+        try {
+          this.tg.unpinChatMessage(cfg.TG_CHAT_ID, { message_id: this.globalMonitorMsgId });
+        } catch (e) {
+          console.error('[TG] Failed to unpin message:', e.message);
+        }
+      }
       this.globalMonitorMsgId = null;
       this.showMainMenu();
       return;
@@ -170,13 +194,22 @@ class TelegramManager {
         
         if (!this.globalMonitorMsgId) {
           const sent = await this.sendMessage(text, { parse_mode: 'Markdown' });
-          if (sent) this.globalMonitorMsgId = sent.message_id;
+          if (sent) {
+            this.globalMonitorMsgId = sent.message_id;
+            try {
+              await this.tg.pinChatMessage(cfg.TG_CHAT_ID, sent.message_id, { disable_notification: true });
+            } catch (e) {
+              console.error('[TG] Failed to pin message:', e.message);
+            }
+          }
         } else {
           try {
             await this.editMessage(this.globalMonitorMsgId, text, { parse_mode: 'Markdown' });
           } catch (e) {
             if (e.message.includes('message is not modified')) return;
-            if (e.message.includes('message to edit not found')) this.globalMonitorMsgId = null;
+            if (e.message.includes('message to edit not found')) {
+              this.globalMonitorMsgId = null;
+            }
           }
         }
       }, 3000);
@@ -190,9 +223,24 @@ class TelegramManager {
     this.activeBotId = null;
     const keyboard = [
       [{ text: '➕ Добавить бота' }, { text: '🤖 Список ботов' }],
-      [{ text: this.globalMonitorEnabled ? '🔕 Выкл Общий Мониторинг' : '📡 Вкл Общий Мониторинг' }]
+      [{ text: this.globalMonitorEnabled ? '🔕 Выкл Общий Мониторинг' : '📡 Вкл Общий Мониторинг' }],
+      [{ text: '⚙️ Настройки' }]
     ];
     this.sendMessage('🛠 *Главное меню*', { 
+      parse_mode: 'Markdown', 
+      reply_markup: { keyboard, resize_keyboard: true, is_persistent: true } 
+    });
+  }
+
+  showSettingsMenu() {
+    this.userState = null;
+    this.activeBotId = null;
+    const keyboard = [
+      [{ text: this.masterName ? `👑 Хозяин: ${this.masterName}` : '👑 Хозяин (не задан)' }],
+      [{ text: `🚨 Радар: ${this.radarEnabled ? 'ВКЛ' : 'ВЫКЛ'}` }, { text: `🛡 Вайт-лист: ${this.whitelist.length} чел.` }],
+      [{ text: '⬅️ Назад в Главное меню' }]
+    ];
+    this.sendMessage('⚙️ *Настройки системы*\n\nНастройте глобальные параметры для всех ботов.', { 
       parse_mode: 'Markdown', 
       reply_markup: { keyboard, resize_keyboard: true, is_persistent: true } 
     });
@@ -376,6 +424,52 @@ class TelegramManager {
         }
         return;
       }
+      if (this.userState.action === 'ADD_MASTER') {
+        const name = text.split(' ')[0];
+        this.masterName = name;
+        this.saveBots();
+        this.userState = null;
+        this.sendMessage(`✅ Хозяин установлен: *${name}*`, { parse_mode: 'Markdown' });
+        this.showSettingsMenu();
+        return;
+      }
+      if (this.userState.action === 'WHITELIST_ACTION') {
+        if (text === '➕ Добавить') {
+          this.userState = { action: 'ADD_WHITELIST' };
+          this.sendMessage('Введите никнейм игрока для добавления в вайт-лист:', { reply_markup: { remove_keyboard: true } });
+        } else if (text === '➖ Удалить') {
+          this.userState = { action: 'REMOVE_WHITELIST' };
+          this.sendMessage('Введите никнейм игрока для удаления из вайт-листа:', { reply_markup: { remove_keyboard: true } });
+        } else if (text === '⬅️ Назад в Настройки') {
+          this.showSettingsMenu();
+        }
+        return;
+      }
+      if (this.userState.action === 'ADD_WHITELIST') {
+        const name = text.split(' ')[0];
+        if (!this.whitelist.includes(name)) {
+           this.whitelist.push(name);
+           this.saveBots();
+           this.sendMessage(`✅ Игрок *${name}* добавлен в вайт-лист!`, { parse_mode: 'Markdown' });
+        } else {
+           this.sendMessage(`⚠️ Игрок *${name}* уже в вайт-листе!`, { parse_mode: 'Markdown' });
+        }
+        this.showSettingsMenu();
+        return;
+      }
+      if (this.userState.action === 'REMOVE_WHITELIST') {
+        const name = text.split(' ')[0];
+        const idx = this.whitelist.indexOf(name);
+        if (idx !== -1) {
+           this.whitelist.splice(idx, 1);
+           this.saveBots();
+           this.sendMessage(`✅ Игрок *${name}* удален из вайт-листа!`, { parse_mode: 'Markdown' });
+        } else {
+           this.sendMessage(`⚠️ Игрок *${name}* не найден в вайт-листе!`, { parse_mode: 'Markdown' });
+        }
+        this.showSettingsMenu();
+        return;
+      }
     }
 
     if (text === '➕ Добавить бота') {
@@ -391,6 +485,42 @@ class TelegramManager {
 
     if (text === '📡 Вкл Общий Мониторинг' || text === '🔕 Выкл Общий Мониторинг') {
       this.setGlobalMonitor(!this.globalMonitorEnabled);
+      return;
+    }
+
+    if (text === '⚙️ Настройки') {
+      this.showSettingsMenu();
+      return;
+    }
+
+    if (text === '⬅️ Назад в Главное меню') {
+      this.showMainMenu();
+      return;
+    }
+
+    if (text.startsWith('👑 Хозяин')) {
+      this.userState = { action: 'ADD_MASTER' };
+      this.sendMessage('Введите ваш точный никнейм в Minecraft:\n(Боты будут слушаться только личных сообщений от этого игрока)', { reply_markup: { remove_keyboard: true } });
+      return;
+    }
+
+    if (text.startsWith('🚨 Радар:')) {
+      this.radarEnabled = !this.radarEnabled;
+      this.saveBots();
+      this.showSettingsMenu();
+      return;
+    }
+
+    if (text.startsWith('🛡 Вайт-лист:')) {
+      this.userState = { action: 'WHITELIST_ACTION' };
+      const wlText = this.whitelist.length > 0 ? this.whitelist.join(', ') : 'Пусто';
+      this.sendMessage(`🛡 *Текущий вайт-лист:*\n${wlText}\n\nЧто хотите сделать?`, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          keyboard: [[{ text: '➕ Добавить' }, { text: '➖ Удалить' }], [{ text: '⬅️ Назад в Настройки' }]],
+          resize_keyboard: true
+        }
+      });
       return;
     }
 

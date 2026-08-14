@@ -39,6 +39,7 @@ class MinecraftBot {
     this.lastInvisWarn = 0;
 
     this.isEating = false;
+    this.radarKicked = false;
   }
 
   start() {
@@ -82,6 +83,7 @@ class MinecraftBot {
       try { this.bot.quit(); } catch (_) {}
     }
     this.isConnected = false;
+    this.radarKicked = false; // Сбрасываем триггер радара при каждом новом подключении
 
     console.log(`[MC ${this.username}] Подключаюсь к ${this.host}:${this.port}…`);
     
@@ -205,6 +207,33 @@ class MinecraftBot {
           this.isEating = false;
         }
       });
+
+      // Радар
+      const checkRadar = (entity) => {
+        if (!this.tg.radarEnabled || this.radarKicked) return;
+        if (!entity || entity.type !== 'player' || !entity.username) return;
+        
+        const username = entity.username;
+        if (username === this.username) return; // сам себя не пугается
+        if (this.tg.masterName && username.toLowerCase() === this.tg.masterName.toLowerCase()) return; // хозяин
+
+        const isWhitelisted = this.tg.whitelist.some(w => w.toLowerCase() === username.toLowerCase());
+        if (!isWhitelisted) {
+          this.radarKicked = true;
+          const dist = this.bot.entity && this.bot.entity.position && entity.position 
+                       ? Math.round(this.bot.entity.position.distanceTo(entity.position)) 
+                       : '?';
+          
+          const safeBotName = this.tg.escapeMarkdown ? this.tg.escapeMarkdown(this.username) : this.username.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+          const safePlayerName = this.tg.escapeMarkdown ? this.tg.escapeMarkdown(username) : username.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+
+          this.tg.sendMessage(`🚨 [ВНИМАНИЕ] Бот ${safeBotName} обнаружил чужого игрока: *${safePlayerName}* (Дистанция: ${dist}). Ливаю с сервера!`, { parse_mode: 'Markdown' });
+          this.stop();
+        }
+      };
+
+      this.bot.on('entitySpawn', checkRadar);
+      this.bot.on('entityMoved', checkRadar);
     });
 
     this.bot.on('windowOpen', (window) => {
@@ -256,14 +285,85 @@ class MinecraftBot {
       ) {
         this.tg.sendMessage(`💬 [${this.username}]: ${text}`);
       }
+
+      // Обработка команд от "Хозяина"
+      if (this.tg.masterName) {
+        const pmMatch = text.match(/^\[(.*?) -> [Яя]\] (.*)$/i) || text.match(/^\[(.*?)\s*->\s*[Яя]\]\s*(.*)$/i);
+        if (pmMatch) {
+          const sender = pmMatch[1].trim();
+          const content = pmMatch[2].trim();
+          if (sender.toLowerCase() === this.tg.masterName.toLowerCase()) {
+            const contentLower = content.toLowerCase();
+            
+            if (contentLower === 'выйди' || contentLower === 'ливай') {
+              this.tg.sendMessage(`👑 [${this.username}] Выполняю команду хозяина: Отключаюсь.`);
+              this.stop();
+              return;
+            } else if (contentLower.startsWith('иди ко мне')) {
+               const coordsMatch = contentLower.match(/иди ко мне\s+([-\d]+)\s+([-\d]+)\s+([-\d]+)/);
+               if (coordsMatch) {
+                 const x = parseInt(coordsMatch[1], 10);
+                 const y = parseInt(coordsMatch[2], 10);
+                 const z = parseInt(coordsMatch[3], 10);
+                 this.tg.sendMessage(`👑 [${this.username}] Иду к хозяину на координаты ${x} ${y} ${z}...`);
+                 this.bot.pathfinder.setGoal(new goals.GoalBlock(x, y, z));
+               } else {
+                 const player = this.bot.players[this.tg.masterName];
+                 if (player && player.entity) {
+                   this.tg.sendMessage(`👑 [${this.username}] Вижу хозяина в радиусе прорисовки! Иду...`);
+                   this.bot.pathfinder.setGoal(new goals.GoalFollow(player.entity, 2), true);
+                 } else {
+                   const msg = 'Не вижу хозяина, отправьте координаты в формате "иди ко мне x y z"';
+                   this.tg.sendMessage(`👑 [${this.username}] ${msg}`);
+                   this.bot.chat(`/m ${sender} ${msg}`);
+                 }
+               }
+               return;
+            } else if (contentLower === 'стоп') {
+               this.tg.sendMessage(`👑 [${this.username}] Остановка всех действий.`);
+               this.stopFarm();
+               this.stopMiner();
+               if (this.bot.pathfinder) this.bot.pathfinder.setGoal(null);
+               this.bot.clearControlStates();
+               return;
+            } else if (contentLower === 'возьми еду') {
+               this.tg.sendMessage(`👑 [${this.username}] Ищу еду...`);
+               const foods = ['golden_apple', 'enchanted_golden_apple', 'cooked_beef', 'cooked_porkchop', 'bread', 'apple', 'carrot', 'baked_potato'];
+               let foundFood = null;
+               for (const f of foods) {
+                 foundFood = this.bot.inventory.items().find(item => item.name === f);
+                 if (foundFood) break;
+               }
+               
+               if (foundFood) {
+                 this.bot.equip(foundFood, 'off-hand').then(() => {
+                   this.tg.sendMessage(`👑 [${this.username}] Взял ${foundFood.name} в левую руку!`);
+                   // Бот продолжает свою логику (например, авто-фарм), если она включена.
+                 }).catch(e => {
+                   this.tg.sendMessage(`👑 [${this.username}] Ошибка при экипировке: ${e.message}`);
+                 });
+               } else {
+                 this.tg.sendMessage(`👑 [${this.username}] Еды в инвентаре не найдено.`);
+               }
+               return;
+            } else {
+               // Дублируем в глобальный чат
+               this.bot.chat(content);
+               return;
+            }
+          }
+        }
+      }
     });
 
     this.bot.on('kicked', (reason) => {
       this.isConnected = false;
       const msg = this.tryParseReason(reason);
       console.warn(`[MC ${this.username}] Kicked: ${msg}`);
-      this.tg.sendMessage(`⛔ [${this.username}] Кикнут: *${this.escapeMarkdown(msg)}*\nПереподключение через 30 сек`, { parse_mode: 'Markdown' });
-      this.scheduleReconnect();
+      if (!this.radarKicked) {
+        this.tg.sendMessage(`⛔ [${this.username}] Кикнут: *${this.escapeMarkdown(msg)}*\nПереподключение через 30 сек`, { parse_mode: 'Markdown' });
+        this.scheduleReconnect();
+      }
     });
 
     this.bot.on('end', (reason) => {
@@ -271,7 +371,9 @@ class MinecraftBot {
       this.isConnected = false;
       if (this.tg.activeBotId === this.id) this.tg.showBotMenu(this.id);
       this.tg.sendMessage(`🔌 [${this.username}] Отключен: ${reason}`);
-      this.scheduleReconnect();
+      if (!this.radarKicked) {
+        this.scheduleReconnect();
+      }
     });
 
     this.bot.on('error', (err) => {
