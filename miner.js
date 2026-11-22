@@ -67,7 +67,7 @@ const DEFAULTS = {
   laneShift: 3, // сдвиг между рядами (ширина бура)
   layerDepth: 3, // спуск между слоями (высота бура)
   airRunToDescend: 6, // столько шагов по пустоте подряд — и спуск
-  maxDrop: 3, // с какой высоты можно спрыгнуть
+  maxDrop: 3, // с какой высоты можно спрыгнуть (без урона от падения — хоть 64)
   maxFails: 3, // столько раз блок не сломался/вернулся — считаем его приватом
   eatAt: 14, // есть при сытости ≤
   repairAt: 100, // чинить бур при прочности ≤
@@ -331,7 +331,7 @@ class Miner {
     if (!this.alive(id)) return { status: 'stopped' };
     if (open === 0) return { status: 'blocked', reason: why || 'нет прохода', dug };
 
-    const ok = await this._walkTo(slices[open - 1].c, {});
+    const ok = await this._walkTo(slices[open - 1].c, { drop: slices[open - 1].drop });
     if (!ok) return { status: 'stuck', dug };
     this.stats.steps += open;
     this._progress();
@@ -474,7 +474,7 @@ class Miner {
     const targetY = below.y - land.drop;
     const landed = await this._waitUntil(
       () => this.bot.entity.onGround && this.bot.entity.position.y < targetY + 0.1,
-      3000,
+      3000 + land.drop * 150,
     );
     if (landed) this._progress();
     return landed;
@@ -513,10 +513,23 @@ class Miner {
       if (!b) return { blocked: 'не прогружено' };
       if (isLiquid(b)) return { blocked: 'жидкость под ногами' };
       if (BAD_FLOOR.has(b.name)) return { blocked: `опасный пол (${b.name})` };
-      if (isSolid(b)) return { drop };
+      if (isSolid(b)) {
+        if (drop > 0) {
+          // Место приземления: рядом с ногами и головой не должно быть жидкостей.
+          for (let dx = -1; dx <= 1; dx++) {
+            for (let dz = -1; dz <= 1; dz++) {
+              for (let h = 0; h <= 1; h++) {
+                const n = this._block(p.offset(dx, 1 + h, dz));
+                if (isLiquid(n)) return { blocked: `внизу ${n.name}` };
+              }
+            }
+          }
+        }
+        return { drop };
+      }
       if (!isPassable(b)) return { blocked: `неровный пол (${b.name})` };
     }
-    return { blocked: 'обрыв' };
+    return { blocked: `обрыв глубже ${this.opt.maxDrop} бл. (MINER_MAX_DROP)` };
   }
 
   _isOpen(c) {
@@ -584,13 +597,13 @@ class Miner {
    * Идёт к центру блока c по прямой. Управляет кнопками сам, без pathfinder.
    * precise — подойти точно (подкрадываясь), нужно перед спуском в шахту 1×1.
    */
-  _walkTo(c, { precise = false } = {}) {
+  _walkTo(c, { precise = false, drop = 0 } = {}) {
     const bot = this.bot;
     const tx = c.x + 0.5;
     const tz = c.z + 0.5;
     const tol = precise ? 0.15 : 0.3;
     const p0 = bot.entity.position;
-    const timeoutMs = 1500 + Math.hypot(tx - p0.x, tz - p0.z) * (precise ? 1200 : 600);
+    const timeoutMs = 1500 + Math.hypot(tx - p0.x, tz - p0.z) * (precise ? 1200 : 600) + drop * 150;
 
     return new Promise((resolve) => {
       const t0 = Date.now();

@@ -75,6 +75,40 @@ describe('шахта: проход карьера', { concurrency: true }, () =>
     assert.equal(bot.minY, 1);
   });
 
+  // Уступ над пустой шахтой: пол на 17 блоков ниже.
+  const ledge = (x, y, z) => (x === 2 && y === 29 && z === 4 ? 'stone' : null);
+
+  test('обрыв глубже maxDrop — останавливается с понятной причиной', async () => {
+    const world = quarryWorld(ledge);
+    const bot = new FakeBot(world, { x: 2, y: 30, z: 4 });
+    const { reason } = await runMiner(bot);
+
+    assert.match(reason, /обрыв глубже 3/);
+    assert.equal(bot.minY, 30, 'не прыгал');
+  });
+
+  test('без урона от падения (maxDrop 64) — прыгает в шахту и копает до дна', async () => {
+    const world = quarryWorld(ledge);
+    const bot = new PhysicsBot(world, { x: 2, y: 30, z: 4 });
+    const { reason, miner } = await runMiner(bot, { maxDrop: 64 });
+
+    assert.deepEqual(bot.violations, []);
+    assert.match(reason, /шахта пройдена/);
+    assert.equal(bot.minY, 1);
+    assert.ok(miner.stats.layers >= 3);
+  });
+
+  test('не прыгает туда, где внизу лава, — ищет другое место', async () => {
+    const lavaPool = (x, y, z) => ledge(x, y, z) || (y === 13 && x === 4 && z === 4 ? 'lava' : null);
+    const world = quarryWorld(lavaPool);
+    const bot = new FakeBot(world, { x: 2, y: 30, z: 4 });
+    const { reason } = await runMiner(bot, { maxDrop: 64 });
+
+    assert.deepEqual(bot.violations, [], 'не приземлялся рядом с лавой');
+    assert.match(reason, /шахта пройдена/);
+    assert.equal(world.get(4, 13, 4), 'lava');
+  });
+
   test('лава: не вскрывает её и не подходит вплотную', async () => {
     const lava = (x, y, z) => (x === 7 && y === 8 && z === 5 ? 'lava' : null);
     const world = quarryWorld(lava);

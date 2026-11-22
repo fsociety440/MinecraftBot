@@ -30,6 +30,7 @@ module.exports = {
     lookahead: int('MINER_LOOKAHEAD', undefined),       // стенок вперёд за заход (3)
     laneLength: int('MINER_LANE_LENGTH', undefined),    // длина ряда, 0 — до упора (0)
     layerDepth: int('MINER_LAYER_DEPTH', undefined),    // спуск между слоями (3)
+    maxDrop: int('MINER_MAX_DROP', undefined),          // с какой высоты можно падать (3)
     eatAt: int('MINER_EAT_AT', undefined),              // есть при сытости ≤ (14)
     repairAt: int('MINER_REPAIR_AT', undefined),        // чинить бур при прочности ≤ (100)
   },
