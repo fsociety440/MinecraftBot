@@ -1,224 +1,194 @@
 /**
- * Тесты шахты без сервера и без сети.
- *
- * Стенд мира — в sim.js: FakeBot (упрощённое движение, быстро) и PhysicsBot
- * (настоящая физика mineflayer). Проверяется логика: змейка, слои, лава,
- * приват, сторож застревания, починка, еда, выброс мусора.
+ * Тесты шахты без сервера и без сети. Стенд мира — в sim.js (яма с висящими
+ * блоками, стены и лобби под приватом, обновление шахты).
  */
 const { describe, test } = require('node:test');
 const assert = require('node:assert/strict');
-const { Miner, dirFromYaw } = require('../miner');
+const { Vec3 } = require('vec3');
+const { Miner } = require('../miner');
 const { f3ToMineflayer, escapeMarkdown } = require('../utils');
-const { FakeBot, PhysicsBot, quarryWorld, countStone } = require('./sim');
+const { FakeBot, mineWorld, countTargets, inPit } = require('./sim');
 
-/** Запускает шахту и ждёт её остановки (или таймаута теста). */
-function runMiner(bot, options = {}, { timeoutMs = 90000, stopAfterSteps = 0 } = {}) {
+const CENTER = { x: 6, y: 51, z: 6 }; // дно ямы
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function waitFor(pred, ms = 30000) {
+  const t0 = Date.now();
+  while (!pred()) {
+    if (Date.now() - t0 > ms) throw new Error('не дождались условия');
+    await sleep(20);
+  }
+}
+
+/** Запускает шахту; возвращает управление, остановку тест делает сам. */
+function startMiner(bot, options = {}) {
   const notes = [];
-  const miner = new Miner(bot, { notify: (t) => notes.push(t), options: { settleMs: 5, ...options } });
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => miner.stop('таймаут теста'), timeoutMs);
-    const poll = stopAfterSteps
-      ? setInterval(() => {
-        if (miner.stats.steps >= stopAfterSteps) miner.stop('достаточно');
-      }, 20)
-      : null;
-    miner.onStop = (reason) => {
-      clearTimeout(timer);
-      if (poll) clearInterval(poll);
-      bot.close();
-      resolve({ reason, miner, notes });
-    };
-    miner.start();
+  const stops = [];
+  const miner = new Miner(bot, {
+    notify: (t) => notes.push(t),
+    options: { settleMs: 5, emptyRescanMs: 20, pauseRetryMs: 50, ...options },
   });
+  miner.onStop = (reason) => stops.push(reason);
+  miner.start();
+  const finish = async () => {
+    miner.stop('тест');
+    await waitFor(() => stops.length > 0, 5000);
+    bot.close();
+  };
+  return { miner, notes, stops, finish };
 }
 
-function openStart(world, x, y, z) {
-  world.set(x, y, z, 'air');
-  world.set(x, y + 1, z, 'air');
-  return { x, y, z };
+/** Ни один блок вне ямы (стены, лобби) не сломан. */
+function brokenOutside(world) {
+  return [...world.diff.entries()]
+    .filter(([k, v]) => v === 'air' && !inPit(...k.split(',').map(Number)))
+    .map(([k]) => k);
 }
 
-describe('шахта: проход карьера', { concurrency: true }, () => {
-  test('карьер: спускается с поверхности, проходит слои змейкой и встаёт на бедроке', async () => {
-    const world = quarryWorld();
-    const bot = new FakeBot(world, { x: 2, y: 13, z: 4 });
-    const total = countStone(world);
-    const { reason, miner } = await runMiner(bot);
+describe('шахта-яма', { concurrency: true }, () => {
+  test('выкапывает яму, ждёт обновления и копает снова — сама не выключается', async () => {
+    const world = mineWorld();
+    const bot = new FakeBot(world, CENTER);
+    const before = countTargets(world);
+    const { miner, notes, stops, finish } = startMiner(bot);
 
-    assert.deepEqual(bot.violations, []);
-    assert.match(reason, /шахта пройдена.*внизу bedrock/);
-    assert.equal(bot.minY, 1, 'дошёл до дна');
-    assert.ok(miner.stats.layers >= 3, `слоёв: ${miner.stats.layers}`);
-    const mined = 1 - countStone(world) / total;
-    assert.ok(mined > 0.75, `выкопано ${(mined * 100).toFixed(0)}%`);
+    await waitFor(() => miner.state === 'ждёт обновления шахты');
+    const firstPass = miner.stats.blocks;
+    assert.ok(countTargets(world) < before * 0.1, `осталось ${countTargets(world)} из ${before}`);
+    assert.ok(notes.some((n) => n.includes('Шахта пуста')));
+
+    world.resetPit(); // прошло 5 минут
+    await waitFor(() => miner.stats.blocks > firstPass + 20);
+
+    assert.equal(stops.length, 0, 'шахта не выключалась сама');
+    assert.deepEqual(brokenOutside(world), []);
+    await finish();
   });
 
-  test('то же на настоящей физике mineflayer', async () => {
-    const world = quarryWorld();
-    const bot = new PhysicsBot(world, { x: 2, y: 13, z: 4 });
-    const total = countStone(world);
-    const { reason } = await runMiner(bot);
+  test('приват: блок в стене пробует 2 раза, запоминает и больше не трогает', async () => {
+    const extra = (x, y, z) => (x === 5 && y === 53 && z === -1 ? 'cobblestone' : null);
+    const world = mineWorld({ extra });
+    const bot = new FakeBot(world, CENTER);
+    const { miner, finish } = startMiner(bot);
 
-    assert.deepEqual(bot.violations, []);
-    assert.match(reason, /шахта пройдена.*внизу bedrock/);
-    assert.equal(bot.minY, 1);
-    assert.ok(1 - countStone(world) / total > 0.75);
+    await waitFor(() => miner.state === 'ждёт обновления шахты');
+    assert.ok(miner.protectedBlocks.has('5,53,-1'));
+    assert.equal(world.get(5, 53, -1), 'cobblestone');
+    assert.deepEqual(brokenOutside(world), []);
+    await finish();
   });
 
-  test('без бура на настоящей физике: туннель 1×2, центровка над шахтой 1×1', async () => {
-    const world = quarryWorld();
-    const bot = new PhysicsBot(world, { x: 2, y: 13, z: 4 }, { drill: false });
-    const { reason } = await runMiner(bot);
+  test('без бура (обычная кирка) тоже выкапывает яму', async () => {
+    const world = mineWorld({ seed: 7 });
+    const bot = new FakeBot(world, CENTER, { drill: false });
+    const before = countTargets(world);
+    const { miner, finish } = startMiner(bot);
 
-    assert.deepEqual(bot.violations, []);
-    assert.match(reason, /шахта пройдена/);
-    assert.equal(bot.minY, 1);
+    await waitFor(() => miner.state === 'ждёт обновления шахты');
+    assert.ok(countTargets(world) < before * 0.1, `осталось ${countTargets(world)} из ${before}`);
+    await finish();
   });
 
-  // Уступ над пустой шахтой: пол на 17 блоков ниже.
-  const ledge = (x, y, z) => (x === 2 && y === 29 && z === 4 ? 'stone' : null);
+  test('унесло из шахты (смерть, телепорт) — возвращается и копает дальше', async () => {
+    const world = mineWorld();
+    const bot = new FakeBot(world, CENTER);
+    const { miner, finish } = startMiner(bot, { center: CENTER });
+    await waitFor(() => miner.stats.blocks > 5);
 
-  test('обрыв глубже maxDrop — останавливается с понятной причиной', async () => {
-    const world = quarryWorld(ledge);
-    const bot = new FakeBot(world, { x: 2, y: 30, z: 4 });
-    const { reason } = await runMiner(bot);
-
-    assert.match(reason, /обрыв глубже 3/);
-    assert.equal(bot.minY, 30, 'не прыгал');
-  });
-
-  test('без урона от падения (maxDrop 64) — прыгает в шахту и копает до дна', async () => {
-    const world = quarryWorld(ledge);
-    const bot = new PhysicsBot(world, { x: 2, y: 30, z: 4 });
-    const { reason, miner } = await runMiner(bot, { maxDrop: 64 });
-
-    assert.deepEqual(bot.violations, []);
-    assert.match(reason, /шахта пройдена/);
-    assert.equal(bot.minY, 1);
-    assert.ok(miner.stats.layers >= 3);
-  });
-
-  test('не прыгает туда, где внизу лава, — ищет другое место', async () => {
-    const lavaPool = (x, y, z) => ledge(x, y, z) || (y === 13 && x === 4 && z === 4 ? 'lava' : null);
-    const world = quarryWorld(lavaPool);
-    const bot = new FakeBot(world, { x: 2, y: 30, z: 4 });
-    const { reason } = await runMiner(bot, { maxDrop: 64 });
-
-    assert.deepEqual(bot.violations, [], 'не приземлялся рядом с лавой');
-    assert.match(reason, /шахта пройдена/);
-    assert.equal(world.get(4, 13, 4), 'lava');
-  });
-
-  test('лава: не вскрывает её и не подходит вплотную', async () => {
-    const lava = (x, y, z) => (x === 7 && y === 8 && z === 5 ? 'lava' : null);
-    const world = quarryWorld(lava);
-    const bot = new FakeBot(world, { x: 2, y: 13, z: 4 });
-    const { reason } = await runMiner(bot);
-
-    assert.deepEqual(bot.violations, []);
-    assert.match(reason, /шахта пройдена/);
-    assert.equal(world.get(7, 8, 5), 'lava');
-  });
-
-  test('приват: блоки откатываются — бот разворачивается, а не долбит вечно', async () => {
-    const world = quarryWorld();
-    const bot = new FakeBot(world, openStart(world, 1, 10, 4), { isProtected: (c) => c.x >= 7 });
-    const { reason, miner } = await runMiner(bot);
-
-    assert.deepEqual(bot.violations, []);
-    assert.match(reason, /шахта пройдена/);
-    assert.ok(Math.floor(bot.entity.position.x) < 7, 'не зашёл в приват');
-    assert.ok(bot.digCount < 1500, `ударов: ${bot.digCount}`);
-    assert.ok(miner.stats.layers >= 2);
-  });
-
-  test('без бура: копает туннель 1×2 и тоже доходит до дна', async () => {
-    const world = quarryWorld();
-    const bot = new FakeBot(world, { x: 2, y: 13, z: 4 }, { drill: false });
-    const { reason } = await runMiner(bot);
-
-    assert.deepEqual(bot.violations, []);
-    assert.match(reason, /шахта пройдена/);
-    assert.equal(bot.minY, 1);
-  });
-
-  test('сторож: бот не может сдвинуться — шахта останавливается с причиной', async () => {
-    const world = quarryWorld();
-    const bot = new FakeBot(world, openStart(world, 1, 10, 4), { frozen: true });
-    const t0 = Date.now();
-    const { reason } = await runMiner(bot, { noProgressMs: 1500 });
-
-    assert.match(reason, /нет продвижения/);
-    assert.ok(Date.now() - t0 < 6000, `остановился за ${Date.now() - t0} мс`);
+    bot.entity.position = new Vec3(30.5, 61, 30.5); // лобби, далеко от ямы
+    world.set(30, 60, 30, 'stone');
+    const was = miner.stats.blocks;
+    await waitFor(() => miner.stats.blocks > was + 5);
+    assert.ok(inPit(...bot.entity.position.floored().toArray()) || bot.entity.position.y < 62);
+    await finish();
   });
 });
 
-describe('шахта: обслуживание', { concurrency: true }, () => {
+describe('шахта: паузы и обслуживание', { concurrency: true }, () => {
+  test('нет кирки — пауза с сообщением, дали кирку — продолжает сама', async () => {
+    const world = mineWorld();
+    const bot = new FakeBot(world, CENTER);
+    const pick = bot.inventory.slots[36];
+    bot.inventory.slots[36] = null;
+    bot.heldItem = null;
+    const { miner, notes, stops, finish } = startMiner(bot);
+
+    await waitFor(() => notes.some((n) => n.includes('на паузе')));
+    assert.equal(miner.stats.blocks, 0);
+    assert.equal(stops.length, 0);
+
+    bot.inventory.slots[36] = pick;
+    await waitFor(() => miner.stats.blocks > 5);
+    assert.ok(notes.some((n) => n.includes('продолжает')));
+    await finish();
+  });
+
   test('бур почти сломан — чинит пузырьками и копает дальше', async () => {
-    const world = quarryWorld();
-    const bot = new FakeBot(world, openStart(world, 1, 10, 4));
+    const world = mineWorld();
+    const bot = new FakeBot(world, CENTER);
     bot.heldItem.durabilityUsed = 1990; // осталось 41
     bot.inventory.slots[10] = { name: 'experience_bottle', slot: 10, count: 64 };
-    const { reason, notes, miner } = await runMiner(bot, {}, { stopAfterSteps: 10 });
+    const { miner, notes, finish } = startMiner(bot);
 
-    assert.equal(reason, 'достаточно');
-    assert.ok(notes.some((n) => n.includes('Починка закончена')), notes.join(' | '));
+    await waitFor(() => miner.stats.blocks > 5);
+    assert.ok(notes.some((n) => n.includes('Починка закончена')));
     assert.ok(bot.heldItem.maxDurability - bot.heldItem.durabilityUsed > 100);
-    assert.equal(bot.heldItem.name, 'netherite_pickaxe');
-    assert.ok(miner.stats.steps >= 10);
+    await finish();
   });
 
-  test('бур почти сломан и пузырьков нет — останавливается, а не ломает бур', async () => {
-    const world = quarryWorld();
-    const bot = new FakeBot(world, openStart(world, 1, 10, 4));
+  test('бур почти сломан, пузырьков нет — пауза, бур не ломает', async () => {
+    const world = mineWorld();
+    const bot = new FakeBot(world, CENTER);
     bot.heldItem.durabilityUsed = 1990;
-    const { reason } = await runMiner(bot);
+    const { miner, notes, stops, finish } = startMiner(bot);
 
-    assert.match(reason, /почти сломан/);
+    await waitFor(() => notes.some((n) => n.includes('на паузе')));
+    await sleep(200);
     assert.equal(bot.digCount, 0);
+    assert.equal(stops.length, 0);
+    assert.ok(miner.running);
+    await finish();
   });
 
-  test('голоден — ест из инвентаря и возвращает бур в руку', async () => {
-    const world = quarryWorld();
-    const bot = new FakeBot(world, openStart(world, 1, 10, 4));
+  test('голоден — ест и возвращает бур в руку', async () => {
+    const world = mineWorld();
+    const bot = new FakeBot(world, CENTER);
     bot.food = 10;
     bot.inventory.slots[11] = { name: 'bread', slot: 11, count: 5 };
-    const { reason } = await runMiner(bot, {}, { stopAfterSteps: 6 });
+    const { miner, finish } = startMiner(bot);
 
-    assert.equal(reason, 'достаточно');
+    await waitFor(() => miner.stats.blocks > 3);
     assert.equal(bot.food, 20);
     assert.equal(bot.inventory.slots[11].count, 4);
     assert.equal(bot.heldItem.name, 'netherite_pickaxe');
+    await finish();
   });
 
   test('инвентарь забит — выбрасывает только мусор', async () => {
-    const world = quarryWorld();
-    const bot = new FakeBot(world, openStart(world, 1, 10, 4));
+    const world = mineWorld();
+    const bot = new FakeBot(world, CENTER);
     for (let s = 9; s < 44; s++) {
       if (s !== 36) bot.inventory.slots[s] = { name: 'cobblestone', slot: s, count: 64 };
     }
     bot.inventory.slots[12] = { name: 'diamond', slot: 12, count: 30 };
     bot.inventory.slots[13] = { name: 'tripwire_hook', slot: 13, count: 1 };
-    const { reason } = await runMiner(bot, {}, { stopAfterSteps: 6 });
+    const { miner, finish } = startMiner(bot);
 
-    assert.equal(reason, 'достаточно');
+    await waitFor(() => miner.stats.blocks > 3);
     assert.ok(bot.inventory.emptySlotCount() > 20);
     assert.equal(bot.inventory.slots[12].name, 'diamond');
     assert.equal(bot.inventory.slots[13].name, 'tripwire_hook');
+    await finish();
   });
 });
 
-test('направление берётся из взгляда, F3 переводится в систему mineflayer', () => {
-  assert.equal(dirFromYaw(0), 0); // север
-  assert.equal(dirFromYaw(-Math.PI / 2), 1); // восток
-  assert.equal(dirFromYaw(Math.PI), 2); // юг
-  assert.equal(dirFromYaw(Math.PI / 2), 3); // запад
-
-  // F3 «-90.0 / 30.0» — смотрим на восток и вниз
-  const { yaw, pitch } = f3ToMineflayer(-90, 30);
-  assert.equal(dirFromYaw(yaw), 1);
+test('F3 переводится в систему mineflayer', () => {
+  const { yaw, pitch } = f3ToMineflayer(-90, 30); // восток, вниз
+  assert.ok(Math.abs(-Math.sin(yaw) - 1) < 1e-9);
   assert.ok(pitch < 0);
-  assert.equal(dirFromYaw(f3ToMineflayer(0, 0).yaw), 2); // F3 0 — юг
+  const south = f3ToMineflayer(0, 0).yaw;
+  assert.ok(Math.abs(-Math.cos(south) - 1) < 1e-9);
 });
 
 test('экранирование Markdown не оставляет лишних слэшей', () => {

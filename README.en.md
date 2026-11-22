@@ -12,7 +12,7 @@ This project is a powerful system for managing Minecraft bots directly from **Te
 * **👥 Multi-Account Support:** Manage an unlimited number of bots simultaneously from a single chat.
 * **🚨 Radar & Anti-Grief (Panic Mode):** The bot constantly scans its render distance. If an unknown player (not in the whitelist) appears, the bot instantly disconnects from the server to save your gear and sends an emergency notification to Telegram.
 * **🛡 Whitelist & "Master" System:** Configure a list of trusted players that the bot won't run away from. Assign a "Master" so the bot listens to their commands via in-game private messages (PM).
-* **⛏ Auto-Miner for 3×3 Drills:** The bot quarries in a serpentine pattern layer by layer, repairs the drill with XP bottles, eats, and tosses junk. See [Miner](#-miner).
+* **⛏ Auto-Miner:** Mines a pit mine with floating blocks (like on HolyWorld), waits for refills, repairs the drill with XP bottles, eats, tosses junk and resumes on its own after reconnecting. See [Miner](#-miner).
 * **⚔️ Combat & Farming Macros:**
   * **Auto-attack (Farming):** The bot attacks nearby mobs and players.
   * **Auto-eat:** Command the bot to grab food in its off-hand (`возьми еду`), allowing it to eat and attack simultaneously.
@@ -62,29 +62,35 @@ node index.js
 
 ## ⛏ Miner
 
-**Start.** Place the bot where you want to dig and face it the right way (**👁 Взгляд** — paste
-the `Facing` line from F3). Put the drill, XP bottles, food and the sphere (player head) in its
-inventory — the sphere goes to the off-hand automatically. Press **⛏ Вкл Шахта**.
+Built for a pit mine like on HolyWorld: a protected pit with floating stone and ore blocks
+that respawn every few minutes.
+
+**Start.** Put the bot into the pit (preferably at the bottom, near the middle) and press
+**⛏ Вкл Шахта**. The bot's spot becomes the mine center. Put the drill, XP bottles, food and
+the sphere (player head) in its inventory — the sphere goes to the off-hand automatically.
 
 **How it digs.**
-1. Hits the block at head level on the face toward itself — the drill clears a 3×3 wall and the
-   bot steps forward. It cuts up to 3 walls ahead, then walks through them in one move.
-2. Blocked (bedrock, barrier, protected region, lava or water nearby, a drop) — shifts 3 blocks
-   sideways and comes back along the next lane. Lanes are adjacent, nothing is skipped.
-3. Can't shift either — the layer is done: it digs 3 blocks down and does the next layer.
-4. Started on top of the mine — goes down right away instead of walking the surface.
-5. Without a drill it works the same, just with a 1×2 tunnel.
+1. Looks for stone and ores within 10 blocks of the center. Walls, floor, ladders and the lobby
+   are never touched.
+2. A block in reach is mined right away (ores first). Otherwise it walks there: falling and
+   ladders are fine, digging its way through is not.
+3. A block that fails twice is protected: it is remembered and skipped. Once enough blocks have
+   broken, it only searches where blocks actually break.
+4. Mine empty — it reports "waiting for refill" and resumes when blocks reappear.
+5. Carried away (death, teleport) — it walks back to the mine center.
+
+**It never turns itself off.** No pickaxe or nothing to repair the drill with — it pauses with a
+message and resumes once fixed. After a disconnect or a bot restart it resumes after joining the
+server (and after the macro). Only the **🛑 Выкл Шахта** button (or the master's "стоп"
+command), farming or invisibility turn it off.
 
 **On its own** it repairs the drill with XP bottles at ≤ 100 durability (needs Mending), eats at
-hunger ≤ 14, and tosses stone/dirt/gravel when ≤ 2 slots are free (keys, spheres and unknown
-items are kept). After a teleport or an anti-cheat setback it continues from the new spot.
+hunger ≤ 14, and tosses stone/cobblestone when ≤ 2 slots are free (keys, spheres and unknown
+items are kept).
 
-**It always reports why it stopped:** mine finished (no way forward, sideways or down), no
-progress for 30 s, drill almost broken with nothing to repair it, no pickaxe, death or
-disconnect. The miner doesn't run together with farming or invisibility — they fight over the
-bot's controls.
+If 🚨 Radar is on, the bot leaves the server as soon as a stranger enters the mine.
 
-Tuning (lane length, layer depth, food and repair thresholds) — `MINER_*` in `.env.example`.
+Tuning (radius, fall height, block list, food and repair thresholds) — `MINER_*` in `.env.example`.
 
 ## 💬 In-Game PM Commands
 If you have set the Master's username, you can message the bot via in-game private messages:
@@ -96,8 +102,8 @@ If you have set the Master's username, you can message the bot via in-game priva
 ```bash
 npm test
 ```
-The miner is tested without a server on a world simulator (`test/sim.js`), including real
-mineflayer physics, with lava, protected regions, no drill, repair, eating and junk tossing.
+The miner is tested without a server on a pit-mine simulator (`test/sim.js`): protected blocks,
+refills, walking back to the mine, pauses, repair, eating and junk tossing.
 
 ## 🛠 Technologies
 * `mineflayer` — A powerful API for creating Minecraft bots.

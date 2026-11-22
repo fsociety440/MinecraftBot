@@ -27,12 +27,11 @@ module.exports = {
 
   // ─── Шахта (подробности и остальные параметры — DEFAULTS в miner.js) ─────
   MINER: {
-    lookahead: int('MINER_LOOKAHEAD', undefined),       // стенок вперёд за заход (3)
-    laneLength: int('MINER_LANE_LENGTH', undefined),    // длина ряда, 0 — до упора (0)
-    layerDepth: int('MINER_LAYER_DEPTH', undefined),    // спуск между слоями (3)
-    maxDrop: int('MINER_MAX_DROP', undefined),          // с какой высоты можно падать (3)
+    radius: int('MINER_RADIUS', undefined),             // радиус шахты от места включения (10)
+    maxDrop: int('MINER_MAX_DROP', undefined),          // с какой высоты можно падать (64)
     eatAt: int('MINER_EAT_AT', undefined),              // есть при сытости ≤ (14)
     repairAt: int('MINER_REPAIR_AT', undefined),        // чинить бур при прочности ≤ (100)
+    targets: process.env.MINER_BLOCKS ? process.env.MINER_BLOCKS.split(',').map((x) => x.trim()).filter(Boolean) : undefined,
   },
 
   // ─── Капча ────────────────────────────────────────────────────────────────

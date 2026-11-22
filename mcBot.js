@@ -43,6 +43,8 @@ class MinecraftBot {
 
     /** @type {Miner | null} */
     this.miner = null;
+    this.minerWanted = false; // игрок включил шахту — держим её включённой между входами
+    this.mineCenter = null; // {x,y,z} — где игрок включил шахту
 
     this.antibotCheckPassed = false;
     this.loginAt = 0;
@@ -65,7 +67,7 @@ class MinecraftBot {
   stop() {
     this.isConnected = false;
     this.stopFarm();
-    this.stopMiner('бот отключён');
+    this.stopMiner('бот отключён', { pause: true });
     this.stopAutoEat();
     if (this.invisEnabled) this.stopInvis();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -78,7 +80,7 @@ class MinecraftBot {
 
   scheduleReconnect() {
     this.stopFarm();
-    this.stopMiner('потеряно соединение');
+    this.stopMiner('потеряно соединение', { pause: true });
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
@@ -135,6 +137,13 @@ class MinecraftBot {
       if (this.macroEnabled && this.macroSequence && this.macroSequence.length > 0) {
         setTimeout(() => this.executeMacro(), 3000);
       }
+    });
+
+    // Каждый вход/смена сервера/возрождение: если шахта была включена — продолжить
+    // (с запасом на макрос входа в режим).
+    bot.on('spawn', () => {
+      const macroMs = this.macroEnabled ? 6000 + 1500 * (this.macroSequence || []).length : 0;
+      this.resumeMinerLater(10000 + macroMs);
     });
 
     bot.once('login', () => {
@@ -260,7 +269,7 @@ class MinecraftBot {
       // Раньше здесь был вызов несуществующего bot.spawn(): он бросал исключение
       // и обрывал этот самый авто-респаун — бот висел на экране смерти.
       console.log(`[MC ${this.username}] Умер`);
-      this.stopMiner('бот умер');
+      // Шахта не выключается: после возрождения сама вернётся к центру шахты.
       this.tg.sendMessage(`💀 [${this.username}] Бот умер! Возрождаюсь...`);
     });
 
@@ -595,35 +604,70 @@ class MinecraftBot {
 
   // --- Шахта (логика — в miner.js) ---
 
-  startMiner() {
+  /**
+   * Включить шахту. manual — игрок нажал кнопку: центр шахты = где сейчас стоит бот,
+   * и шахта запоминается включённой (переживает переподключение и перезапуск).
+   */
+  startMiner({ manual = true } = {}) {
     const bot = this.bot;
     if (!bot || !this.isConnected || !bot.entity) {
-      this.tg.sendMessage(`❌ [${this.username}] Бот не в игре — шахту не запустить`);
+      if (manual) this.tg.sendMessage(`❌ [${this.username}] Бот не в игре — шахту не запустить`);
       return;
     }
     if (this.minerEnabled) return;
-    // Раз игрок запускает шахту, бот уже на сервере: антибот позади, физика нужна.
+    // Раз шахта запускается, бот уже на сервере: антибот позади, физика нужна.
     this.antibotCheckPassed = true;
     bot.physicsEnabled = true;
     // Режимы, которые дерутся за управление ботом.
     this.stopFarm();
     if (this.invisEnabled) this.stopInvis();
 
+    if (manual || !this.mineCenter) {
+      const p = bot.entity.position.floored();
+      this.mineCenter = { x: p.x, y: p.y, z: p.z };
+    }
+    this.minerWanted = true;
+    this.tg.saveBots();
+
     const miner = new Miner(bot, {
       notify: (t) => this.tg.sendMessage(`[${this.username}] ${t}`),
       log: (t) => console.log(`[MC ${this.username}] шахта: ${t}`),
-      options: cfg.MINER,
+      options: { ...cfg.MINER, center: this.mineCenter },
     });
     miner.onStop = (reason) => {
-      this.tg.sendMessage(`🛑 [${this.username}] Шахта остановлена: ${reason}\n📊 ${miner.summary()}`);
+      const head = this.minerWanted
+        ? `⏸ [${this.username}] Шахта приостановлена: ${reason}. Продолжу сама после входа на сервер`
+        : `🛑 [${this.username}] Шахта выключена: ${reason}`;
+      this.tg.sendMessage(`${head}\n📊 ${miner.summary()}`);
       if (reason !== MANUAL_STOP && this.tg.activeBotId === this.id) this.tg.showBotMenu(this.id);
     };
     this.miner = miner;
     miner.start();
   }
 
-  stopMiner(reason = MANUAL_STOP) {
+  /**
+   * Выключить шахту. pause — временно (разрыв соединения, отключение): после
+   * следующего входа на сервер она продолжит сама. Без pause — выключена игроком.
+   */
+  stopMiner(reason = MANUAL_STOP, { pause = false } = {}) {
+    if (!pause && this.minerWanted) {
+      this.minerWanted = false;
+      this.tg.saveBots();
+    }
     if (this.miner) this.miner.stop(reason);
+  }
+
+  /** После входа/возрождения: если шахта была включена — продолжить. */
+  resumeMinerLater(delayMs = 10000) {
+    if (!this.minerWanted) return;
+    if (this._resumeTimer) clearTimeout(this._resumeTimer);
+    this._resumeTimer = setTimeout(() => {
+      this._resumeTimer = null;
+      if (!this.minerWanted || this.minerEnabled || !this.isConnected || !this.bot || !this.bot.entity) return;
+      if (this.openWindow) return this.resumeMinerLater(5000); // открыто меню/капча — подождём
+      this.tg.sendMessage(`▶️ [${this.username}] Возобновляю шахту`);
+      this.startMiner({ manual: false });
+    }, delayMs);
   }
 
   // --- Invisibility ---

@@ -1,15 +1,31 @@
 /**
- * Упрощённый симулятор мира для тестов шахты: блоки в Map, бур ломает 3×3
- * в плоскости грани удара, гравитация — по блоку за тик, ходьба — 0.25 блока
- * за тик с проверкой столкновений. Это не физика Minecraft, а стенд для логики.
+ * Стенд для тестов шахты: мир в Map, без сервера и сети.
+ *
+ * Шахта как на скриншоте HolyWorld: яма 13×13 (x,z 0..12), пол y=50, стены и
+ * лобби вокруг — под приватом; внутри (y 52..58) висят блоки камня и руды.
+ * Бур ломает 3×3 в плоскости грани удара; приват откатывает блоки через «пинг».
+ * pathfinder подменён: goto ставит бота в ближайшую точку, где можно стоять.
  */
 const { EventEmitter } = require('node:events');
 const { Vec3 } = require('vec3');
 
+const NAMES = [
+  'air', 'bedrock', 'stone', 'cobblestone', 'iron_ore', 'redstone_ore', 'lapis_ore',
+  'dark_oak_planks', 'ladder', 'lava', 'water',
+];
+const BLOCKS_BY_NAME = Object.fromEntries(NAMES.map((name, id) => [name, { id, name }]));
 const UNBREAKABLE = new Set(['bedrock']);
-const EMPTY = new Set(['air', 'water', 'lava']);
-const passable = (name) => name === 'air';
-const NEIGHBORS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+const EMPTY = new Set(['air', 'water', 'lava', 'ladder']);
+const passable = (name) => name === 'air' || name === 'ladder';
+
+const PIT = { min: 0, max: 12, floor: 50, top: 60 };
+const inPit = (x, y, z) => x >= PIT.min && x <= PIT.max && z >= PIT.min && z <= PIT.max && y > PIT.floor && y < PIT.top;
+
+function hash(x, y, z, seed) {
+  let h = (x * 374761393 + y * 668265263 + z * 2147483647 + seed * 1442695041) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) % 100;
+}
 
 class FakeWorld {
   constructor(gen) {
@@ -25,6 +41,51 @@ class FakeWorld {
   set(x, y, z, name) {
     this.diff.set(`${x},${y},${z}`, name);
   }
+
+  /** Обновление шахты: всё в яме возвращается как было. */
+  resetPit() {
+    for (const k of [...this.diff.keys()]) {
+      const [x, y, z] = k.split(',').map(Number);
+      if (inPit(x, y, z)) this.diff.delete(k);
+    }
+  }
+}
+
+/** Яма с висящими блоками; extra(x,y,z) может подменить любой блок. */
+function mineWorld({ seed = 1, extra = () => null } = {}) {
+  return new FakeWorld((x, y, z) => {
+    const special = extra(x, y, z);
+    if (special) return special;
+    if (y < PIT.floor) return 'bedrock';
+    const ring = x >= PIT.min - 1 && x <= PIT.max + 1 && z >= PIT.min - 1 && z <= PIT.max + 1;
+    if (inPit(x, y, z)) {
+      if (y < 52 || y > 58) return 'air';
+      const h = hash(x, y, z, seed);
+      if (h < 12) return 'stone';
+      if (h < 18) return 'cobblestone';
+      if (h < 21) return 'iron_ore';
+      if (h < 23) return 'redstone_ore';
+      if (h < 25) return 'lapis_ore';
+      return 'air';
+    }
+    if (y === PIT.floor && ring) return 'dark_oak_planks';
+    if (ring && y < PIT.top) return x === PIT.min - 1 && z === 6 ? 'ladder' : 'dark_oak_planks';
+    if (y === PIT.top || y === PIT.floor) return 'stone'; // пол лобби — тоже камень, но приват
+    return 'air';
+  });
+}
+
+function countTargets(world) {
+  let n = 0;
+  for (let x = PIT.min; x <= PIT.max; x++) {
+    for (let z = PIT.min; z <= PIT.max; z++) {
+      for (let y = PIT.floor + 1; y < PIT.top; y++) {
+        const name = world.get(x, y, z);
+        if (name !== 'air' && name !== 'ladder') n++;
+      }
+    }
+  }
+  return n;
 }
 
 class FakeBot extends EventEmitter {
@@ -32,15 +93,16 @@ class FakeBot extends EventEmitter {
     super();
     this.world = world;
     this.drill = opts.drill !== false;
-    this.isProtected = opts.isProtected || (() => false);
-    this.frozen = !!opts.frozen;
+    this.isProtected = opts.isProtected || ((c) => !inPit(c.x, c.y, c.z));
     this.game = { minY: 0, height: 256 };
     this.player = { ping: 0 };
+    this.health = 20;
+    this.isAlive = true;
     this.food = 20;
-    this.registry = { foodsByName: { bread: { foodPoints: 5, saturation: 6 } } };
+    this.registry = { blocksByName: BLOCKS_BY_NAME, foodsByName: { bread: { foodPoints: 5, saturation: 6 } } };
     this.entity = {
       position: new Vec3(start.x + 0.5, start.y, start.z + 0.5),
-      yaw: opts.yaw ?? -Math.PI / 2, // восток
+      yaw: 0,
       pitch: 0,
       onGround: true,
     };
@@ -55,8 +117,13 @@ class FakeBot extends EventEmitter {
     };
     this.heldItem = pick;
     this.digCount = 0;
-    this.violations = [];
-    this.minY = start.y;
+    this.gotoCount = 0;
+    this.brokenOutside = [];
+    this.pathfinder = {
+      goto: (goal) => this._goto(goal),
+      setGoal: () => {},
+      setMovements: () => {},
+    };
     this.timer = setInterval(() => this.tick(), 1);
   }
 
@@ -73,12 +140,28 @@ class FakeBot extends EventEmitter {
     const unbreakable = UNBREAKABLE.has(name);
     return {
       name,
-      type: name === 'air' ? 0 : 1,
+      type: BLOCKS_BY_NAME[name].id,
       position: new Vec3(x, y, z),
       boundingBox: EMPTY.has(name) ? 'empty' : 'block',
       hardness: unbreakable ? null : 1.5,
       diggable: !unbreakable,
     };
+  }
+
+  findBlocks({ point, matching, maxDistance, count }) {
+    const ids = new Set(matching);
+    const out = [];
+    const r = Math.ceil(maxDistance);
+    for (let x = point.x - r; x <= point.x + r; x++) {
+      for (let y = point.y - r; y <= point.y + r; y++) {
+        for (let z = point.z - r; z <= point.z + r; z++) {
+          if (y < 0 || y >= 256) continue;
+          if (ids.has(BLOCKS_BY_NAME[this.world.get(x, y, z)].id)) out.push(new Vec3(x, y, z));
+        }
+      }
+    }
+    out.sort((a, b) => a.distanceTo(point) - b.distanceTo(point));
+    return out.slice(0, count);
   }
 
   digTime(block) {
@@ -91,19 +174,18 @@ class FakeBot extends EventEmitter {
     const p = block.position;
     const eye = this.entity.position.offset(0, 1.62, 0);
     const reach = eye.distanceTo(p.offset(0.5, 0.5, 0.5));
-    if (reach > 5) this.violations.push(`дальность удара ${reach.toFixed(2)}`);
+    if (reach > 5.5) throw new Error(`дальность удара ${reach.toFixed(2)}`);
 
-    const cells = [];
+    const cells = [p];
     if (this.drill) {
       for (let a = -1; a <= 1; a++) {
         for (let b = -1; b <= 1; b++) {
-          if (face.y) cells.push(p.offset(a, 0, b));
-          else if (face.x) cells.push(p.offset(0, a, b));
-          else cells.push(p.offset(a, b, 0));
+          if (!a && !b) continue;
+          if (typeof face === 'object' && face.x) cells.push(p.offset(0, a, b));
+          else if (typeof face === 'object' && face.z) cells.push(p.offset(a, b, 0));
+          else cells.push(p.offset(a, 0, b));
         }
       }
-    } else {
-      cells.push(p);
     }
     const restore = [];
     for (const c of cells) {
@@ -111,9 +193,7 @@ class FakeBot extends EventEmitter {
       if (UNBREAKABLE.has(name) || EMPTY.has(name)) continue;
       this.world.set(c.x, c.y, c.z, 'air');
       if (this.isProtected(c)) restore.push([c, name]);
-      else this._checkLava(c, 'лава открыта ударом');
     }
-    // Приват: сервер откатывает блоки через «пинг».
     if (restore.length) {
       setTimeout(() => {
         for (const [c, name] of restore) this.world.set(c.x, c.y, c.z, name);
@@ -121,13 +201,28 @@ class FakeBot extends EventEmitter {
     }
   }
 
-  _checkLava(c, label) {
-    for (const [dx, dy, dz] of NEIGHBORS) {
-      if (this.world.get(c.x + dx, c.y + dy, c.z + dz) === 'lava') {
-        this.violations.push(`${label} у ${c.x},${c.y},${c.z}`);
-        return;
+  /** Упрощённый pathfinder: ближайшая точка у цели, где можно стоять. */
+  _goto(goal) {
+    this.gotoCount++;
+    let best = null;
+    let bestD = Infinity;
+    for (let x = goal.x - 4; x <= goal.x + 4; x++) {
+      for (let y = goal.y - 4; y <= goal.y + 4; y++) {
+        for (let z = goal.z - 4; z <= goal.z + 4; z++) {
+          const d = (x - goal.x) ** 2 + (y - goal.y) ** 2 + (z - goal.z) ** 2;
+          if (d > goal.rangeSq || d >= bestD) continue;
+          if (!passable(this.world.get(x, y, z)) || !passable(this.world.get(x, y + 1, z))) continue;
+          if (EMPTY.has(this.world.get(x, y - 1, z))) continue;
+          best = new Vec3(x + 0.5, y, z + 0.5);
+          bestD = d;
+        }
       }
     }
+    if (!best) return Promise.reject(new Error('No path to the goal!'));
+    return new Promise((resolve) => setTimeout(() => {
+      this.entity.position = best;
+      resolve();
+    }, 2));
   }
 
   stopDigging() {}
@@ -196,116 +291,22 @@ class FakeBot extends EventEmitter {
     return null;
   }
 
+  /** Гравитация: падает по блоку за тик, пока под ногами пусто (лестница держит). */
   tick() {
-    const e = this.entity;
-    const p = e.position;
-    const fx = Math.floor(p.x);
-    const fz = Math.floor(p.z);
-    const below = this.world.get(fx, Math.floor(p.y) - 1, fz);
-    if (!this.frozen && passable(below) && p.y > 1) {
-      p.y = Math.floor(p.y) - 1;
-      e.onGround = false;
-    } else {
-      e.onGround = true;
-    }
-
-    if (!this.frozen && this.controlState.forward) {
-      const speed = this.controlState.sneak ? 0.05 : 0.25;
-      const nx = p.x - Math.sin(e.yaw) * speed;
-      const nz = p.z - Math.cos(e.yaw) * speed;
-      const by = Math.floor(p.y);
-      const bx = Math.floor(nx);
-      const bz = Math.floor(nz);
-      if (passable(this.world.get(bx, by, bz)) && passable(this.world.get(bx, by + 1, bz))) {
-        p.x = nx;
-        p.z = nz;
-      }
-    }
-
-    const cx = Math.floor(p.x);
-    const cy = Math.floor(p.y);
-    const cz = Math.floor(p.z);
-    if (!passable(this.world.get(cx, cy, cz)) || !passable(this.world.get(cx, cy + 1, cz))) {
-      this.violations.push(`бот внутри блока ${cx},${cy},${cz}`);
-    }
-    this._checkLava(new Vec3(cx, cy, cz), 'бот рядом с лавой');
-    this._checkLava(new Vec3(cx, cy + 1, cz), 'бот рядом с лавой');
-    this.minY = Math.min(this.minY, cy);
-    this.emit('physicsTick');
-  }
-}
-
-/**
- * Тот же стенд, но движение и гравитация — настоящая физика mineflayer
- * (prismarine-physics 1.16.5): инерция, трение, хитбокс 0.6×1.8, Shift не даёт
- * упасть с края. Блоки — настоящие prismarine-block. Тик идёт быстрее реального.
- */
-class PhysicsBot extends FakeBot {
-  constructor(world, start, opts = {}) {
-    super(world, start, opts);
-    const version = '1.16.5';
-    const { Physics, PlayerState } = require('prismarine-physics');
-    this.version = version;
-    this.mcData = require('minecraft-data')(version);
-    this.Block = require('prismarine-block')(version);
-    this.PlayerState = PlayerState;
-    this.entity.velocity = new Vec3(0, 0, 0);
-    this.entity.effects = {};
-    this.jumpTicks = 0;
-    this.jumpQueued = false;
-    this.fireworkRocketDuration = 0;
-    this.physicsWorld = { getBlock: (p) => this.blockAt(p) };
-    this.physics = Physics(this.mcData, this.physicsWorld);
-  }
-
-  blockAt(p) {
+    const p = this.entity.position;
     const x = Math.floor(p.x);
     const y = Math.floor(p.y);
     const z = Math.floor(p.z);
-    if (y < 0 || y >= 256) return null;
-    const block = this.Block.fromStateId(this.mcData.blocksByName[this.world.get(x, y, z)].defaultState, 0);
-    block.position = new Vec3(x, y, z);
-    return block;
-  }
-
-  tick() {
-    if (!this.frozen && this.physics) {
-      const cs = this.controlState;
-      const control = {
-        forward: !!cs.forward, back: !!cs.back, left: !!cs.left, right: !!cs.right,
-        jump: !!cs.jump, sprint: !!cs.sprint, sneak: !!cs.sneak,
-      };
-      const state = new this.PlayerState(this, control);
-      this.physics.simulatePlayer(state, this.physicsWorld);
-      state.apply(this);
+    const here = this.world.get(x, y, z);
+    const below = this.world.get(x, y - 1, z);
+    if (here !== 'ladder' && EMPTY.has(below) && y > 1) {
+      this.entity.position = new Vec3(p.x, y - 1, p.z);
+      this.entity.onGround = false;
+    } else {
+      this.entity.onGround = true;
     }
-    const p = this.entity.position.floored();
-    this._checkLava(p, 'бот рядом с лавой');
-    this._checkLava(p.offset(0, 1, 0), 'бот рядом с лавой');
-    this.minY = Math.min(this.minY, p.y);
     this.emit('physicsTick');
   }
 }
 
-/** Каменная коробка x 0..11, z 0..8, y 1..12 в бедроковых стенах, дно — бедрок. */
-function quarryWorld(extra = () => null) {
-  return new FakeWorld((x, y, z) => {
-    const special = extra(x, y, z);
-    if (special) return special;
-    if (y === 0) return 'bedrock';
-    if (x < 0 || x > 11 || z < 0 || z > 8) return y <= 14 ? 'bedrock' : 'air';
-    return y <= 12 ? 'stone' : 'air';
-  });
-}
-
-function countStone(world) {
-  let n = 0;
-  for (let x = 0; x <= 11; x++) {
-    for (let z = 0; z <= 8; z++) {
-      for (let y = 1; y <= 12; y++) if (world.get(x, y, z) === 'stone') n++;
-    }
-  }
-  return n;
-}
-
-module.exports = { FakeWorld, FakeBot, PhysicsBot, quarryWorld, countStone };
+module.exports = { FakeWorld, FakeBot, mineWorld, countTargets, inPit, PIT };
