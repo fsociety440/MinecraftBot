@@ -67,7 +67,11 @@ class TelegramManager {
   saveBots() {
     const botsArray = [];
     for (const bot of this.bots.values()) {
-      botsArray.push({ username: bot.username, host: bot.host, port: bot.port, macroSequence: bot.macroSequence, macroEnabled: bot.macroEnabled });
+      botsArray.push({
+        username: bot.username, host: bot.host, port: bot.port,
+        macroSequence: bot.macroSequence, macroEnabled: bot.macroEnabled,
+        minerWanted: !!bot.minerWanted, mineCenter: bot.mineCenter || null,
+      });
     }
     const data = {
       masterName: this.masterName,
@@ -90,7 +94,7 @@ class TelegramManager {
           botsData = raw.bots || [];
         }
         for (const b of botsData) {
-          if (this.onAddBot) this.onAddBot(b.username, b.host, b.port, false, b.macroSequence, b.macroEnabled);
+          if (this.onAddBot) this.onAddBot(b.username, b.host, b.port, false, b.macroSequence, b.macroEnabled, b);
         }
       } catch (e) {
         console.error('[TG] Failed to load bots:', e);
@@ -302,12 +306,14 @@ class TelegramManager {
 
     this.activeBotId = botId;
 
-    const mine = bot.minerEnabled ? `ВКЛ (${bot.miner.shortStatus()})` : 'ВЫКЛ';
+    const mine = bot.minerEnabled
+      ? `ВКЛ (${bot.miner.shortStatus()})`
+      : bot.minerWanted ? 'ВКЛ (продолжит после входа на сервер)' : 'ВЫКЛ';
     const text = `🤖 *Бот:* ${this.escapeMarkdown(bot.username)}\n🌐 *Сервер:* ${this.escapeMarkdown(bot.host)}:${bot.port}\n📶 *Статус:* ${bot.isConnected ? '✅ Онлайн' : '❌ Оффлайн'}\n⛏ *Шахта:* ${mine}\n⚔️ *Фарм:* ${bot.farmInterval ? 'ВКЛ' : 'ВЫКЛ'}\n🍔 *Еда:* ${bot.autoEatInterval ? 'ВКЛ' : 'ВЫКЛ'}`;
     
     const keyboard = [
       [{ text: bot.isConnected ? '🔴 Отключиться' : '🟢 Подключиться' }],
-      [{ text: bot.farmInterval ? '🛑 Выкл Фарм' : '⚔️ Вкл Фарм' }, { text: bot.minerEnabled ? '🛑 Выкл Шахта' : '⛏ Вкл Шахта' }, { text: bot.invisEnabled ? '🛑 Выкл Инвиз' : '👻 Вкл Инвиз' }],
+      [{ text: bot.farmInterval ? '🛑 Выкл Фарм' : '⚔️ Вкл Фарм' }, { text: (bot.minerEnabled || bot.minerWanted) ? '🛑 Выкл Шахта' : '⛏ Вкл Шахта' }, { text: bot.invisEnabled ? '🛑 Выкл Инвиз' : '👻 Вкл Инвиз' }],
       [{ text: '🧭 Компас' }, { text: bot.autoEatInterval ? '🛑 Выкл ЕДА' : '🍎 Вкл ЕДА' }, { text: '🎒 Слоты' }, { text: '👁 Взгляд' }],
       [{ text: '🤖 Макросы' }, { text: '💬 Чат' }],
       [{ text: '🗑 Удалить' }, { text: '⬅️ Назад к списку' }]
@@ -567,7 +573,7 @@ class TelegramManager {
         return;
       }
       if (text === '⛏ Вкл Шахта' || text === '🛑 Выкл Шахта') {
-        bot.minerEnabled ? bot.stopMiner() : bot.startMiner();
+        (bot.minerEnabled || bot.minerWanted) ? bot.stopMiner() : bot.startMiner();
         this.showBotMenu(this.activeBotId);
         return;
       }
