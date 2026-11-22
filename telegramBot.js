@@ -2,6 +2,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const path = require('path');
 const cfg = require('./config');
+const { escapeMarkdown, f3ToMineflayer } = require('./utils');
 
 const BOTS_FILE = path.join(__dirname, 'bots.json');
 
@@ -22,10 +23,31 @@ class TelegramManager {
   }
 
   init() {
-    this.tg.on('message', (msg) => this.handleMessage(msg));
-    this.tg.on('callback_query', (query) => this.handleCallback(query));
+    // Команды принимаем только из чата владельца: бот в Telegram может найти кто угодно,
+    // а без этой проверки любой мог удалять ботов и писать в игровой чат от их имени.
+    this.tg.on('message', (msg) => {
+      if (!this.isOwner(msg.chat && msg.chat.id)) return this.reportStranger(msg.chat && msg.chat.id, msg.from);
+      this.handleMessage(msg);
+    });
+    this.tg.on('callback_query', (query) => {
+      const chatId = query.message ? query.message.chat.id : query.from && query.from.id;
+      if (!this.isOwner(chatId)) return this.reportStranger(chatId, query.from);
+      this.handleCallback(query);
+    });
+    if (!cfg.TG_CHAT_ID) {
+      console.warn('[TG] TG_CHAT_ID не задан в .env — бот не будет слушать никого. Напишите ему, chat_id появится в консоли.');
+    }
     console.log('[TG] Telegram-менеджер запущен. Отправьте /menu');
     this.sendMessage('🤖 Бот запущен! Отправьте /menu для управления.');
+  }
+
+  isOwner(chatId) {
+    return !!cfg.TG_CHAT_ID && String(chatId) === String(cfg.TG_CHAT_ID);
+  }
+
+  reportStranger(chatId, from) {
+    const who = from ? `${from.username ? '@' + from.username : ''} ${from.first_name || ''}`.trim() : '';
+    console.warn(`[TG] Игнорирую сообщение из чужого чата ${chatId} ${who}. Если это вы — впишите TG_CHAT_ID=${chatId} в .env`);
   }
 
   registerBot(mcBot) {
@@ -280,7 +302,8 @@ class TelegramManager {
 
     this.activeBotId = botId;
 
-    const text = `🤖 *Бот:* ${this.escapeMarkdown(bot.username)}\n🌐 *Сервер:* ${this.escapeMarkdown(bot.host)}:${bot.port}\n📶 *Статус:* ${bot.isConnected ? '✅ Онлайн' : '❌ Оффлайн'}\n⚔️ *Фарм:* ${bot.farmInterval ? 'ВКЛ' : 'ВЫКЛ'}\n🍔 *Еда:* ${bot.autoEatInterval ? 'ВКЛ' : 'ВЫКЛ'}`;
+    const mine = bot.minerEnabled ? `ВКЛ (${bot.miner.shortStatus()})` : 'ВЫКЛ';
+    const text = `🤖 *Бот:* ${this.escapeMarkdown(bot.username)}\n🌐 *Сервер:* ${this.escapeMarkdown(bot.host)}:${bot.port}\n📶 *Статус:* ${bot.isConnected ? '✅ Онлайн' : '❌ Оффлайн'}\n⛏ *Шахта:* ${mine}\n⚔️ *Фарм:* ${bot.farmInterval ? 'ВКЛ' : 'ВЫКЛ'}\n🍔 *Еда:* ${bot.autoEatInterval ? 'ВКЛ' : 'ВЫКЛ'}`;
     
     const keyboard = [
       [{ text: bot.isConnected ? '🔴 Отключиться' : '🟢 Подключиться' }],
@@ -401,8 +424,9 @@ class TelegramManager {
           if (match) {
             const mcYaw = parseFloat(match[1]);
             const mcPitch = parseFloat(match[2]);
-            const yaw = mcYaw * (Math.PI / 180);
-            const pitch = mcPitch * (Math.PI / 180);
+            // Градусы F3 и радианы mineflayer отсчитываются от разных сторон —
+            // раньше бот смотрел зеркально и вверх вместо вниз.
+            const { yaw, pitch } = f3ToMineflayer(mcYaw, mcPitch);
             bot.lookAt(yaw, pitch);
             this.sendMessage('👁 [' + bot.username + '] Взгляд направлен (yaw=' + mcYaw + ', pitch=' + mcPitch + ')');
           } else {
@@ -582,7 +606,7 @@ class TelegramManager {
       }
       if (text === '👁 Взгляд') {
         this.userState = { action: 'LOOK', botId: this.activeBotId };
-        this.sendMessage('👁 Управление взглядом\nСкопируйте строчку Facing из F3...');
+        this.sendMessage('👁 Управление взглядом\nСкопируйте строчку Facing из F3 и отправьте сюда.\nНапример: `Facing: east -90.0 / 0.0` или просто `-90 / 0`\n\nШахта копает в ту сторону света, куда смотрит бот.', { parse_mode: 'Markdown' });
         return;
       }
       if (text === '💬 Чат') {
@@ -641,74 +665,15 @@ class TelegramManager {
     const cmd = parts[0];
     const botId = parts[1];
 
+    // Инлайн-кнопки сейчас есть только у меню сервера (slot:) и у капчи (enter_captcha:),
+    // всё остальное управление — обычной клавиатурой в handleMessage.
     try {
-      if (cmd === 'main_menu') this.showMainMenu();
-      else if (cmd === 'list_bots') this.showBotList();
-      else if (cmd === 'add_bot_start') {
-        this.userState = { action: 'ADD_BOT_NAME' };
-        this.sendMessage('Введите никнейм для нового бота:');
-      }
-      else if (cmd === 'bot_menu') {
-        this.showBotMenu(botId);
-      }
-      else if (cmd === 'toggle_farm') {
-        const bot = this.bots.get(botId);
-        if (bot) {
-          bot.farmInterval ? bot.stopFarm() : bot.startFarm();
-          this.showBotMenu(botId); // refresh menu
-        }
-      }
-      else if (cmd === 'toggle_monitor') {
-        const bot = this.bots.get(botId);
-        if (bot) {
-          bot.setMonitor(!bot.monitorEnabled);
-          this.showBotMenu(botId);
-        }
-      }
-      else if (cmd === 'use_compass') {
-        const bot = this.bots.get(botId);
-        if (bot) bot.useCompass();
-      }
-      else if (cmd === 'enter_chat') {
-        const bot = this.bots.get(botId);
-        if (bot) {
-          this.userState = { action: 'CHAT', botId };
-          this.sendMessage(`💬 Режим чата для ${bot.username} активирован. Все ваши сообщения будут отправляться на сервер.\nДля выхода напишите /stopchat`);
-        }
-      }
-      else if (cmd === 'enter_look') {
-        const bot = this.bots.get(botId);
-        if (bot) {
-          this.userState = { action: 'LOOK', botId };
-          this.sendMessage(`👁 *Управление взглядом*\nСкопируйте строчку Facing из F3 (где написаны градусы через слэш XX/XX) и отправьте сюда.\nНапример: \`Facing: south 123.4 / 56.7\` или просто \`123.4 / 56.7\``, { parse_mode: 'Markdown' });
-        }
-      }
-      else if (cmd === 'eat_item') {
-        const bot = this.bots.get(botId);
-        if (bot) {
-          bot.eatItem();
-        }
-      }
-      else if (cmd === 'enter_captcha') {
-        const bot = this.bots.get(botId);
-        if (bot) {
-          this.userState = { action: 'CAPTCHA', botId };
-          this.sendMessage(`✍️ Напишите цифры с капчи для ${bot.username}:`);
-        }
-      }
-      else if (cmd === 'slot') {
-        const bot = this.bots.get(botId);
-        const slotIdx = parseInt(parts[2], 10);
-        if (bot) bot.clickSlot(slotIdx);
-      }
-      else if (cmd === 'reconnect') {
-        const bot = this.bots.get(botId);
-        if (bot) bot.scheduleReconnect();
-      }
-      else if (cmd === 'delete_bot') {
-        this.removeBot(botId);
-        this.sendMessage('🗑 Бот удален.');
-        this.showBotList();
+      const bot = this.bots.get(botId);
+      if (cmd === 'enter_captcha' && bot) {
+        this.userState = { action: 'CAPTCHA', botId };
+        this.sendMessage(`✍️ Напишите цифры с капчи для ${bot.username}:`);
+      } else if (cmd === 'slot' && bot) {
+        bot.clickSlot(parseInt(parts[2], 10));
       }
 
       await this.tg.answerCallbackQuery(query.id);
@@ -718,7 +683,7 @@ class TelegramManager {
   }
 
   escapeMarkdown(text) {
-    return String(text).replace(/([_*\[\]()~`])/g, '\\$1');
+    return escapeMarkdown(text);
   }
 }
 

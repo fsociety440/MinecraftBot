@@ -2,6 +2,18 @@ const mineflayer = require('mineflayer');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const cfg = require('./config');
 const captcha = require('./captcha');
+const { Miner } = require('./miner');
+const { sleep } = require('./utils');
+
+// Сколько после входа действуют обходы BotFilter (пустота вместо незагруженных
+// чанков и заморозка физики в комнате капчи). Потом они только мешают.
+const ANTIBOT_PHASE_MS = 5 * 60 * 1000;
+
+const MANUAL_STOP = 'по команде';
+
+function fakeAir(pos) {
+  return { position: pos, type: 0, name: 'air', boundingBox: 'empty', transparent: true, shapes: [] };
+}
 
 class MinecraftBot {
   /**
@@ -18,28 +30,32 @@ class MinecraftBot {
     this.tg = tgManager;
 
     this.bot = null;
-    this.farmInterval = null;
+    this.isConnected = false;
     this.reconnectTimer = null;
+    this.openWindow = null;
+
+    this.farmInterval = null;
     this.autoEatInterval = null;
     this.invisEnabled = false;
+    this.lastInvisWarn = 0;
     this.macroSequence = [];
     this.macroEnabled = false;
-    
+
+    /** @type {Miner | null} */
+    this.miner = null;
+
     this.antibotCheckPassed = false;
-    
-    // Auto-monitor
-    this.monitorEnabled = false;
-    this.monitorInterval = null;
-    this.lastMonitorMsgId = null;
-
-    this.minerEnabled = false;
-    this.isMining = false;
-    this.badBlocks = new Map();
-
-    this.lastInvisWarn = 0;
-
-    this.isEating = false;
+    this.loginAt = 0;
     this.radarKicked = false;
+  }
+
+  get minerEnabled() {
+    return !!(this.miner && this.miner.running);
+  }
+
+  /** Идёт ли ещё проверка антибота (в это время действуют обходы BotFilter). */
+  inAntibotPhase() {
+    return !this.antibotCheckPassed && Date.now() - this.loginAt < ANTIBOT_PHASE_MS;
   }
 
   start() {
@@ -49,10 +65,11 @@ class MinecraftBot {
   stop() {
     this.isConnected = false;
     this.stopFarm();
-    this.stopMiner();
+    this.stopMiner('бот отключён');
     this.stopAutoEat();
     if (this.invisEnabled) this.stopInvis();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
     if (this.bot) {
       try { this.bot.quit(); } catch (_) {}
       this.bot = null;
@@ -61,6 +78,7 @@ class MinecraftBot {
 
   scheduleReconnect() {
     this.stopFarm();
+    this.stopMiner('потеряно соединение');
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
@@ -84,10 +102,12 @@ class MinecraftBot {
     }
     this.isConnected = false;
     this.radarKicked = false; // Сбрасываем триггер радара при каждом новом подключении
+    this.antibotCheckPassed = false;
+    this.openWindow = null;
 
     console.log(`[MC ${this.username}] Подключаюсь к ${this.host}:${this.port}…`);
-    
-    this.bot = mineflayer.createBot({
+
+    const bot = mineflayer.createBot({
       host: this.host,
       port: this.port,
       username: this.username,
@@ -96,60 +116,67 @@ class MinecraftBot {
       hideErrors: false,
       physicsEnabled: true,
     });
+    this.bot = bot;
 
-    this.bot._client.on('kick_disconnect', (packet) => {
+    bot._client.on('kick_disconnect', (packet) => {
       console.warn(`[MC ${this.username} RAW kick_disconnect]`, JSON.stringify(packet));
     });
 
-    // Removed custom teleport_confirm to prevent infinite loops on Bungee
-    this.bot.loadPlugin(pathfinder);
+    bot.loadPlugin(pathfinder);
 
-    this.bot.once('spawn', () => {
-      this.antibotCheckPassed = false;
+    bot.once('spawn', () => {
       console.log(`[MC ${this.username}] Spawned!`);
+      // Движения для «иди ко мне»: без паркура (частая причина откатов античита).
+      const moves = new Movements(bot);
+      moves.allowParkour = false;
+      moves.maxDropDown = 3;
+      bot.pathfinder.setMovements(moves);
+
       if (this.macroEnabled && this.macroSequence && this.macroSequence.length > 0) {
-        setTimeout(() => {
-          this.executeMacro();
-        }, 3000); // Wait 3 seconds after spawn
+        setTimeout(() => this.executeMacro(), 3000);
       }
     });
 
-    this.bot.once('login', () => {
+    bot.once('login', () => {
       const isFirstLogin = !this.isConnected;
       this.isConnected = true;
+      this.loginAt = Date.now();
       if (isFirstLogin) {
         if (this.tg.activeBotId === this.id) this.tg.showBotMenu(this.id);
-        this.tg.sendMessage(`✅ Бот *${this.escapeMarkdown(this.username)}* зашел на сервер \n\`${this.host}:${this.port}\``, {
+        this.tg.sendMessage(`✅ Бот *${this.tg.escapeMarkdown(this.username)}* зашел на сервер \n\`${this.host}:${this.port}\``, {
           parse_mode: 'Markdown',
         });
       }
-      console.log(`[MC ${this.username}] Login. Applying physics bypass hooks...`);
-      
-      captcha.initMapListener(this.bot);
-      this.bot.physicsEnabled = true;
+      console.log(`[MC ${this.username}] Login`);
 
-      // ОБХОД БОТФИЛЬТРА
-      if (this.bot.world && !this.bot.world._originalGetBlock) {
-        const world = this.bot.world;
-        world._originalGetBlock = world.getBlock.bind(world);
+      captcha.initMapListener(bot);
+      bot.physicsEnabled = true;
+
+      // ОБХОД БОТФИЛЬТРА. mineflayer не считает физику, пока бот в незагруженном
+      // чанке, а BotFilter проверяет падение в пустоте. Поэтому в фазе антибота
+      // незагруженные блоки выдаём за воздух. После неё — честный null, иначе
+      // после каждого телепорта бот проваливается в ещё не пришедшие чанки.
+      if (bot.world && !bot.world._originalGetBlock) {
+        const world = bot.world;
+        const original = world.getBlock.bind(world);
+        world._originalGetBlock = original;
         world.getBlock = (pos) => {
-          try {
-            const b = world._originalGetBlock(pos);
-            if (b === null || b === undefined) {
-              return { position: pos, type: 0, name: 'air', boundingBox: 'empty', transparent: true, shapes: [] };
-            }
-            return b;
-          } catch (e) {
-            return { position: pos, type: 0, name: 'air', boundingBox: 'empty', transparent: true, shapes: [] };
-          }
+          let block = null;
+          try { block = original(pos); } catch (_) {}
+          if (block) return block;
+          return this.inAntibotPhase() ? fakeAir(pos) : null;
         };
       }
 
-      this.bot.on('forcedMove', () => {
-        if (this.bot.entity && this.bot.entity.position && this.bot.entity.position.y < 100 && this.bot.physicsEnabled && !this.antibotCheckPassed) {
-           this.bot.physicsEnabled = false;
-           this.bot.clearControlStates();
-           console.log(`[MC ${this.username}] Teleported to captcha room. Physics disabled.`);
+      bot.on('forcedMove', () => {
+        // Комната капчи: замораживаем физику, чтобы бот не падал, пока вводим капчу.
+        // Только в фазе антибота — иначе любой /spawn или откат античита ниже y=100
+        // навсегда выключал физику.
+        if (!this.inAntibotPhase()) return;
+        if (bot.entity && bot.entity.position && bot.entity.position.y < 100 && bot.physicsEnabled) {
+          bot.physicsEnabled = false;
+          bot.clearControlStates();
+          console.log(`[MC ${this.username}] Teleported to captcha room. Physics disabled.`);
         }
       });
 
@@ -160,16 +187,14 @@ class MinecraftBot {
         if (captchaDebounce) clearTimeout(captchaDebounce);
         captchaDebounce = setTimeout(async () => {
           captchaDebounce = null;
-          if (!this.bot.entity || !this.bot.entity.position) return;
-          
-          const nearbyFrames = Object.values(this.bot.entities).filter(e => {
-            if (!e || !e.name) return false;
-            const n = e.name;
-            if (n !== 'item_frame' && n !== 'glow_item_frame') return false;
-            if (!e.position) return false;
-            return e.position.distanceTo(this.bot.entity.position) <= 10;
+          if (!bot.entity || !bot.entity.position) return;
+
+          const nearbyFrames = Object.values(bot.entities).filter((e) => {
+            if (!e || !e.name || !e.position) return false;
+            if (e.name !== 'item_frame' && e.name !== 'glow_item_frame') return false;
+            return e.position.distanceTo(bot.entity.position) <= 10;
           });
-          
+
           const needed = Math.floor((cfg.CAPTCHA_COLS * cfg.CAPTCHA_ROWS) / 2);
           if (nearbyFrames.length >= needed) {
             const now = Date.now();
@@ -177,34 +202,19 @@ class MinecraftBot {
             lastCaptchaTime = now;
             console.log(`[MC ${this.username}] Капча (${nearbyFrames.length} рамок)`);
             this.tg.sendMessage(`🗺 [${this.username}] Собираю капчу…`);
-            await captcha.captureAndSendCaptcha(this.bot, this);
+            await captcha.captureAndSendCaptcha(bot, this);
           }
         }, 1500);
       };
 
-      this.bot.on('entitySpawn', (entity) => {
+      bot.on('entitySpawn', (entity) => {
         if (!entity || !entity.name) return;
-        if (entity.name === 'item_frame' || entity.name === 'glow_item_frame') {
-          triggerCaptchaCheck();
-        }
+        if (entity.name === 'item_frame' || entity.name === 'glow_item_frame') triggerCaptchaCheck();
       });
 
-      this.bot.on('map_updated', () => {
-        if (this.bot.entity && this.bot.entity.position && this.bot.entity.position.y < 100 && !this.bot.physicsEnabled && !this.antibotCheckPassed) {
+      bot.on('map_updated', () => {
+        if (bot.entity && bot.entity.position && bot.entity.position.y < 100 && !bot.physicsEnabled && !this.antibotCheckPassed) {
           triggerCaptchaCheck();
-        }
-      });
-
-      // Авто-еда
-      this.bot.on('health', async () => {
-        if (this.bot.food < 20 && !this.isEating && this.bot.physicsEnabled) {
-          this.isEating = true;
-          try {
-            this.bot.activateItem(true); 
-            await this.sleep(2000);
-            this.bot.deactivateItem();
-          } catch (e) {}
-          this.isEating = false;
         }
       });
 
@@ -212,53 +222,53 @@ class MinecraftBot {
       const checkRadar = (entity) => {
         if (!this.tg.radarEnabled || this.radarKicked) return;
         if (!entity || entity.type !== 'player' || !entity.username) return;
-        
+
         const username = entity.username;
         if (username === this.username) return; // сам себя не пугается
         if (this.tg.masterName && username.toLowerCase() === this.tg.masterName.toLowerCase()) return; // хозяин
 
-        const isWhitelisted = this.tg.whitelist.some(w => w.toLowerCase() === username.toLowerCase());
+        const isWhitelisted = this.tg.whitelist.some((w) => w.toLowerCase() === username.toLowerCase());
         if (!isWhitelisted) {
           this.radarKicked = true;
-          const dist = this.bot.entity && this.bot.entity.position && entity.position 
-                       ? Math.round(this.bot.entity.position.distanceTo(entity.position)) 
-                       : '?';
-          
-          const safeBotName = this.tg.escapeMarkdown ? this.tg.escapeMarkdown(this.username) : this.username.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-          const safePlayerName = this.tg.escapeMarkdown ? this.tg.escapeMarkdown(username) : username.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-
-          this.tg.sendMessage(`🚨 [ВНИМАНИЕ] Бот ${safeBotName} обнаружил чужого игрока: *${safePlayerName}* (Дистанция: ${dist}). Ливаю с сервера!`, { parse_mode: 'Markdown' });
+          const dist = bot.entity && bot.entity.position && entity.position
+            ? Math.round(bot.entity.position.distanceTo(entity.position))
+            : '?';
+          const esc = (t) => this.tg.escapeMarkdown(t);
+          this.tg.sendMessage(`🚨 [ВНИМАНИЕ] Бот ${esc(this.username)} обнаружил чужого игрока: *${esc(username)}* (Дистанция: ${dist}). Ливаю с сервера!`, { parse_mode: 'Markdown' });
           this.stop();
         }
       };
 
-      this.bot.on('entitySpawn', checkRadar);
-      this.bot.on('entityMoved', checkRadar);
+      bot.on('entitySpawn', checkRadar);
+      bot.on('entityMoved', checkRadar);
     });
 
-    this.bot.on('windowOpen', (window) => {
+    bot.on('windowOpen', (window) => {
       this.openWindow = window;
       this.antibotCheckPassed = true;
-      this.bot.physicsEnabled = true;
+      bot.physicsEnabled = true;
       console.log(`[MC ${this.username}] windowOpen: "${window.title}"`);
       this.sendCurrentWindowMenu();
     });
 
-    this.bot.on('windowClose', () => {
+    bot.on('windowClose', () => {
       this.openWindow = null;
     });
 
-    this.bot.on('death', () => {
+    bot.on('death', () => {
+      // Возрождение делает сам mineflayer (опция respawn включена по умолчанию).
+      // Раньше здесь был вызов несуществующего bot.spawn(): он бросал исключение
+      // и обрывал этот самый авто-респаун — бот висел на экране смерти.
       console.log(`[MC ${this.username}] Умер`);
+      this.stopMiner('бот умер');
       this.tg.sendMessage(`💀 [${this.username}] Бот умер! Возрождаюсь...`);
-      this.bot.spawn();
     });
 
-    this.bot.on('message', async (jsonMsg) => {
+    bot.on('message', (jsonMsg) => {
       if (typeof jsonMsg.toAnsi !== 'function') return;
       const text = jsonMsg.toString();
       const lower = text.toLowerCase();
-      
+
       if (
         lower.includes('уважаемый игрок') ||
         lower.includes('vk.me') ||
@@ -269,11 +279,11 @@ class MinecraftBot {
       }
 
       const checkPassedPhrases = ['проверка пройдена', 'успешно пройдена', 'спасибо за подтверждение', 'вы успешно прошли проверку', 'добро пожаловать', 'вы прошли', 'welcome', 'verification passed', 'check passed', 'успешно', 'авторизуйтесь', '/login', '/reg', 'пароль'];
-      const isCheckPassed = checkPassedPhrases.some(p => lower.includes(p));
+      const isCheckPassed = checkPassedPhrases.some((p) => lower.includes(p));
 
       if (isCheckPassed && !this.antibotCheckPassed) {
         this.antibotCheckPassed = true;
-        this.bot.physicsEnabled = true;
+        bot.physicsEnabled = true;
         console.log(`[MC ${this.username}] Проверка пройдена`);
         this.tg.sendMessage(`✅ [${this.username}] Антибот пройден!`);
       }
@@ -286,99 +296,89 @@ class MinecraftBot {
         this.tg.sendMessage(`💬 [${this.username}]: ${text}`);
       }
 
-      // Обработка команд от "Хозяина"
-      if (this.tg.masterName) {
-        const pmMatch = text.match(/^\[(.*?) -> [Яя]\] (.*)$/i) || text.match(/^\[(.*?)\s*->\s*[Яя]\]\s*(.*)$/i);
-        if (pmMatch) {
-          const sender = pmMatch[1].trim();
-          const content = pmMatch[2].trim();
-          if (sender.toLowerCase() === this.tg.masterName.toLowerCase()) {
-            const contentLower = content.toLowerCase();
-            
-            if (contentLower === 'выйди' || contentLower === 'ливай') {
-              this.tg.sendMessage(`👑 [${this.username}] Выполняю команду хозяина: Отключаюсь.`);
-              this.stop();
-              return;
-            } else if (contentLower.startsWith('иди ко мне')) {
-               const coordsMatch = contentLower.match(/иди ко мне\s+([-\d]+)\s+([-\d]+)\s+([-\d]+)/);
-               if (coordsMatch) {
-                 const x = parseInt(coordsMatch[1], 10);
-                 const y = parseInt(coordsMatch[2], 10);
-                 const z = parseInt(coordsMatch[3], 10);
-                 this.tg.sendMessage(`👑 [${this.username}] Иду к хозяину на координаты ${x} ${y} ${z}...`);
-                 this.bot.pathfinder.setGoal(new goals.GoalBlock(x, y, z));
-               } else {
-                 const player = this.bot.players[this.tg.masterName];
-                 if (player && player.entity) {
-                   this.tg.sendMessage(`👑 [${this.username}] Вижу хозяина в радиусе прорисовки! Иду...`);
-                   this.bot.pathfinder.setGoal(new goals.GoalFollow(player.entity, 2), true);
-                 } else {
-                   const msg = 'Не вижу хозяина, отправьте координаты в формате "иди ко мне x y z"';
-                   this.tg.sendMessage(`👑 [${this.username}] ${msg}`);
-                   this.bot.chat(`/m ${sender} ${msg}`);
-                 }
-               }
-               return;
-            } else if (contentLower === 'стоп') {
-               this.tg.sendMessage(`👑 [${this.username}] Остановка всех действий.`);
-               this.stopFarm();
-               this.stopMiner();
-               if (this.bot.pathfinder) this.bot.pathfinder.setGoal(null);
-               this.bot.clearControlStates();
-               return;
-            } else if (contentLower === 'возьми еду') {
-               this.tg.sendMessage(`👑 [${this.username}] Ищу еду...`);
-               const foods = ['golden_apple', 'enchanted_golden_apple', 'cooked_beef', 'cooked_porkchop', 'bread', 'apple', 'carrot', 'baked_potato'];
-               let foundFood = null;
-               for (const f of foods) {
-                 foundFood = this.bot.inventory.items().find(item => item.name === f);
-                 if (foundFood) break;
-               }
-               
-               if (foundFood) {
-                 this.bot.equip(foundFood, 'off-hand').then(() => {
-                   this.tg.sendMessage(`👑 [${this.username}] Взял ${foundFood.name} в левую руку!`);
-                   // Бот продолжает свою логику (например, авто-фарм), если она включена.
-                 }).catch(e => {
-                   this.tg.sendMessage(`👑 [${this.username}] Ошибка при экипировке: ${e.message}`);
-                 });
-               } else {
-                 this.tg.sendMessage(`👑 [${this.username}] Еды в инвентаре не найдено.`);
-               }
-               return;
-            } else {
-               // Дублируем в глобальный чат
-               this.bot.chat(content);
-               return;
-            }
-          }
-        }
-      }
+      if (this.tg.masterName) this.handleMasterMessage(text);
     });
 
-    this.bot.on('kicked', (reason) => {
+    bot.on('kicked', (reason) => {
       this.isConnected = false;
       const msg = this.tryParseReason(reason);
       console.warn(`[MC ${this.username}] Kicked: ${msg}`);
       if (!this.radarKicked) {
-        this.tg.sendMessage(`⛔ [${this.username}] Кикнут: *${this.escapeMarkdown(msg)}*\nПереподключение через 30 сек`, { parse_mode: 'Markdown' });
+        const sec = Math.round(cfg.RECONNECT_DELAY_MS / 1000);
+        this.tg.sendMessage(`⛔ [${this.username}] Кикнут: *${this.tg.escapeMarkdown(msg)}*\nПереподключение через ${sec} сек`, { parse_mode: 'Markdown' });
         this.scheduleReconnect();
       }
     });
 
-    this.bot.on('end', (reason) => {
+    bot.on('end', (reason) => {
       if (!this.isConnected) return;
       this.isConnected = false;
       if (this.tg.activeBotId === this.id) this.tg.showBotMenu(this.id);
       this.tg.sendMessage(`🔌 [${this.username}] Отключен: ${reason}`);
-      if (!this.radarKicked) {
-        this.scheduleReconnect();
-      }
+      if (!this.radarKicked) this.scheduleReconnect();
     });
 
-    this.bot.on('error', (err) => {
+    bot.on('error', (err) => {
       console.error(`[MC ${this.username}] Error:`, err.message);
     });
+  }
+
+  // --- Команды хозяина (ЛС в игре) ---
+
+  handleMasterMessage(text) {
+    const bot = this.bot;
+    const pmMatch = text.match(/^\[(.*?)\s*->\s*[Яя]\]\s*(.*)$/i);
+    if (!pmMatch) return;
+    const sender = pmMatch[1].trim();
+    const content = pmMatch[2].trim();
+    if (sender.toLowerCase() !== this.tg.masterName.toLowerCase()) return;
+    const contentLower = content.toLowerCase();
+
+    if (contentLower === 'выйди' || contentLower === 'ливай') {
+      this.tg.sendMessage(`👑 [${this.username}] Выполняю команду хозяина: Отключаюсь.`);
+      this.stop();
+    } else if (contentLower.startsWith('иди ко мне')) {
+      this.stopMiner('команда хозяина');
+      const coordsMatch = contentLower.match(/иди ко мне\s+([-\d]+)\s+([-\d]+)\s+([-\d]+)/);
+      if (coordsMatch) {
+        const [x, y, z] = coordsMatch.slice(1, 4).map((n) => parseInt(n, 10));
+        this.tg.sendMessage(`👑 [${this.username}] Иду к хозяину на координаты ${x} ${y} ${z}...`);
+        bot.pathfinder.setGoal(new goals.GoalBlock(x, y, z));
+      } else {
+        const player = bot.players[this.tg.masterName];
+        if (player && player.entity) {
+          this.tg.sendMessage(`👑 [${this.username}] Вижу хозяина в радиусе прорисовки! Иду...`);
+          bot.pathfinder.setGoal(new goals.GoalFollow(player.entity, 2), true);
+        } else {
+          const msg = 'Не вижу хозяина, отправьте координаты в формате "иди ко мне x y z"';
+          this.tg.sendMessage(`👑 [${this.username}] ${msg}`);
+          bot.chat(`/m ${sender} ${msg}`);
+        }
+      }
+    } else if (contentLower === 'стоп') {
+      this.tg.sendMessage(`👑 [${this.username}] Остановка всех действий.`);
+      this.stopFarm();
+      this.stopMiner('команда хозяина');
+      if (bot.pathfinder) bot.pathfinder.setGoal(null);
+      bot.clearControlStates();
+    } else if (contentLower === 'возьми еду') {
+      this.tg.sendMessage(`👑 [${this.username}] Ищу еду...`);
+      const foods = ['golden_apple', 'enchanted_golden_apple', 'cooked_beef', 'cooked_porkchop', 'bread', 'apple', 'carrot', 'baked_potato'];
+      let foundFood = null;
+      for (const f of foods) {
+        foundFood = bot.inventory.items().find((item) => item.name === f);
+        if (foundFood) break;
+      }
+      if (foundFood) {
+        bot.equip(foundFood, 'off-hand')
+          .then(() => this.tg.sendMessage(`👑 [${this.username}] Взял ${foundFood.name} в левую руку!`))
+          .catch((e) => this.tg.sendMessage(`👑 [${this.username}] Ошибка при экипировке: ${e.message}`));
+      } else {
+        this.tg.sendMessage(`👑 [${this.username}] Еды в инвентаре не найдено.`);
+      }
+    } else {
+      bot.chat(content); // Дублируем в глобальный чат
+    }
   }
 
   // --- Actions ---
@@ -386,7 +386,7 @@ class MinecraftBot {
   sendCurrentWindowMenu() {
     if (!this.openWindow) return;
     if (this._menuTimeout) clearTimeout(this._menuTimeout);
-    
+
     this._menuTimeout = setTimeout(() => {
       if (!this.openWindow) return;
       const window = this.openWindow;
@@ -395,14 +395,13 @@ class MinecraftBot {
         const item = window.slots[i];
         if (!item) continue;
 
-        let rawName = item.customName;
-        let name = this.extractJsonText(rawName);
+        let name = this.extractJsonText(item.customName);
         if (!name.trim()) {
           name = this.extractJsonText(item.displayName || item.name || `Item#${item.type}`);
         }
 
         const lore = (item.nbt?.value?.display?.value?.Lore?.value?.value || [])
-          .map(l => this.stripColorCodes(this.extractJsonText(l)));
+          .map((l) => this.stripColorCodes(this.extractJsonText(l)));
 
         items.push({ slot: i, name: this.stripColorCodes(name), lore });
       }
@@ -417,45 +416,34 @@ class MinecraftBot {
   }
 
   async useCompass() {
-    if (!this.bot) return;
+    if (!this.bot) return false;
     try {
-      const compass = this.bot.inventory.items().find(item => item.name === 'compass');
+      const compass = this.bot.inventory.items().find((item) => item.name === 'compass');
       if (!compass) {
         this.tg.sendMessage(`⚠️ [${this.username}] В инвентаре нет компаса.`);
-        return;
+        return false;
       }
       await this.bot.equip(compass, 'hand');
-      await this.sleep(500);
+      await sleep(500);
       this.bot.activateItem();
       this.tg.sendMessage(`🧭 [${this.username}] Открываю компас...`);
+      return true;
     } catch (err) {
       this.tg.sendMessage(`❌ [${this.username}] Ошибка компаса: ${err.message}`);
+      return false;
     }
   }
 
   async executeMacro() {
     if (!this.bot) return;
     this.tg.sendMessage(`🤖 [${this.username}] Выполняю макрос...`);
-    
-    // First, use compass
-    const compass = this.bot.inventory.items().find(item => item.name === 'compass');
-    if (compass) {
-      try {
-        await this.bot.equip(compass, 'hand');
-        await this.sleep(500);
-        this.bot.activateItem();
-        await this.sleep(2000); // Ждем 2 сек, пока откроется меню компаса
-      } catch(e) {}
-    } else {
-      this.tg.sendMessage(`⚠️ [${this.username}] Нет компаса для макроса, продолжаю...`);
-    }
+    if (await this.useCompass()) await sleep(2000); // Ждем, пока откроется меню компаса
 
-    // Loop through slots
     for (const slot of this.macroSequence) {
       if (!this.bot) break;
       this.tg.sendMessage(`🤖 [${this.username}] Макрос: клик слота ${slot}...`);
       await this.clickSlot(slot);
-      await this.sleep(1500); // Задержка между кликами
+      await sleep(1500); // Задержка между кликами
     }
     this.tg.sendMessage(`🤖 [${this.username}] Макрос завершен.`);
   }
@@ -466,16 +454,19 @@ class MinecraftBot {
       this.tg.sendMessage(`❌ [${this.username}] Нет открытого окна`);
       return;
     }
+    const refreshMenu = () => setTimeout(() => {
+      if (this.openWindow) this.sendCurrentWindowMenu();
+    }, 1500);
     try {
       let mouseButton = 0; // Default to Left Click
       const item = this.openWindow.slots[slotIndex];
       if (item) {
         let name = this.extractJsonText(item.customName);
         if (!name.trim()) name = this.extractJsonText(item.displayName || item.name || '');
-        
+
         const lore = (item.nbt?.value?.display?.value?.Lore?.value?.value || [])
-          .map(l => this.extractJsonText(l)).join(' ');
-        
+          .map((l) => this.extractJsonText(l)).join(' ');
+
         const fullText = (name + ' ' + lore).toLowerCase();
         if (fullText.includes('пкм') || fullText.includes('правая') || fullText.includes('right click')) {
           mouseButton = 1;
@@ -484,23 +475,12 @@ class MinecraftBot {
 
       await this.bot.clickWindow(slotIndex, mouseButton, 0);
       this.tg.sendMessage(`👆 [${this.username}] Нажал на слот ${slotIndex} (${mouseButton === 1 ? 'ПКМ' : 'ЛКМ'})`);
-
       // Сервер может обновить содержимое текущего окна без отправки нового windowOpen.
-      // Ждём 1.5 секунды и отправляем обновлённое меню, если окно всё ещё открыто.
-      setTimeout(() => {
-        if (this.openWindow) {
-          this.sendCurrentWindowMenu();
-        }
-      }, 1500);
-
+      refreshMenu();
     } catch (err) {
       if (err.message && err.message.includes("Server didn't respond to transaction for clicking on slot")) {
         // Сервер часто не присылает подтверждение транзакции в кастомных меню, но клик проходит
-        setTimeout(() => {
-          if (this.openWindow) {
-            this.sendCurrentWindowMenu();
-          }
-        }, 1500);
+        refreshMenu();
         return;
       }
       this.tg.sendMessage(`❌ [${this.username}] Ошибка слота: ${err.message}`);
@@ -509,13 +489,13 @@ class MinecraftBot {
 
   startFarm() {
     if (this.farmInterval) return;
+    this.stopMiner('включён фарм');
     this.farmInterval = setInterval(() => {
       if (!this.bot || !this.isConnected || !this.bot.entity) return;
       try {
         // Проверяем сущность строго в перекрестии прицела (как обычный автокликер)
         const target = this.bot.entityAtCursor(4.0);
-        
-        if (target && (target.type === 'mob' || target.type === 'animal' || (target.type === 'player' && target.username !== this.bot.username))) {
+        if (target && (target.type === 'mob' || target.type === 'hostile' || target.type === 'animal' || (target.type === 'player' && target.username !== this.bot.username))) {
           this.bot.attack(target);
         } else {
           this.bot.swingArm('right');
@@ -533,34 +513,26 @@ class MinecraftBot {
     }
   }
 
-  async eatItem() {
-    if (!this.bot) return;
-    this.tg.sendMessage(`🍎 [${this.username}] Кушаю предмет из левой руки...`);
-    try {
-      this.bot.activateItem(true); 
-      await this.sleep(2000);
-      this.bot.deactivateItem();
-    } catch (e) {
-      this.tg.sendMessage(`❌ [${this.username}] Ошибка при поедании: ${e.message}`);
-    }
-  }
-
+  /** Авто-еда для фарма: ест то, что лежит в левой руке, если это еда. */
   startAutoEat() {
     if (this.autoEatInterval) return;
     let isEating = false;
     this.autoEatInterval = setInterval(async () => {
-      if (!this.bot || !this.isConnected || isEating) return;
-      if (this.bot.food < 18) {
+      const bot = this.bot;
+      if (!bot || !this.isConnected || isEating || this.minerEnabled) return; // шахта ест сама
+      const off = bot.inventory && bot.inventory.slots[45];
+      const isFood = off && bot.registry.foodsByName && bot.registry.foodsByName[off.name];
+      if (bot.food < 18 && isFood) {
         isEating = true;
         try {
-          this.bot.activateItem(true); 
-          await this.sleep(2000);
-          this.bot.deactivateItem();
+          bot.activateItem(true);
+          await sleep(1800);
+          bot.deactivateItem();
         } catch (_) {}
         isEating = false;
       }
     }, 3000);
-    this.tg.sendMessage(`🍔 [${this.username}] Авто-Еда Включена (кушает при сытости < 18)`);
+    this.tg.sendMessage(`🍔 [${this.username}] Авто-Еда Включена (ест из левой руки при сытости < 18)`);
   }
 
   stopAutoEat() {
@@ -574,8 +546,7 @@ class MinecraftBot {
   setSlot(slotIndex) {
     if (!this.bot) return;
     try {
-      // hotbar is 0-8 in mineflayer
-      this.bot.setQuickBarSlot(slotIndex);
+      this.bot.setQuickBarSlot(slotIndex); // hotbar is 0-8 in mineflayer
       this.tg.sendMessage(`🎒 [${this.username}] Выбран слот ${slotIndex + 1}`);
     } catch (e) {
       this.tg.sendMessage(`❌ Ошибка выбора слота: ${e.message}`);
@@ -598,7 +569,7 @@ class MinecraftBot {
         this.bot._client.write('block_dig', {
           status: 6, // swap item in hand
           location: { x: 0, y: 0, z: 0 },
-          face: 255
+          face: 255,
         });
         this.tg.sendMessage(`🎒 [${this.username}] Предмет перенесён (пакетом).`);
       } catch (err2) {
@@ -622,31 +593,44 @@ class MinecraftBot {
     } catch (e) {}
   }
 
-  // --- Auto Miner ---
+  // --- Шахта (логика — в miner.js) ---
 
   startMiner() {
+    const bot = this.bot;
+    if (!bot || !this.isConnected || !bot.entity) {
+      this.tg.sendMessage(`❌ [${this.username}] Бот не в игре — шахту не запустить`);
+      return;
+    }
+    if (this.minerEnabled) return;
+    // Раз игрок запускает шахту, бот уже на сервере: антибот позади, физика нужна.
     this.antibotCheckPassed = true;
-    this.bot.physicsEnabled = true;
-    this.minerEnabled = true;
-    if (this.isMining) return;
-    this.isMining = true;
-    this.badBlocks.clear();
-    this.tg.sendMessage(`⛏ [${this.username}] Авто-Шахта ВКЛЮЧЕНА`);
-    this.mineLoop();
+    bot.physicsEnabled = true;
+    // Режимы, которые дерутся за управление ботом.
+    this.stopFarm();
+    if (this.invisEnabled) this.stopInvis();
+
+    const miner = new Miner(bot, {
+      notify: (t) => this.tg.sendMessage(`[${this.username}] ${t}`),
+      log: (t) => console.log(`[MC ${this.username}] шахта: ${t}`),
+      options: cfg.MINER,
+    });
+    miner.onStop = (reason) => {
+      this.tg.sendMessage(`🛑 [${this.username}] Шахта остановлена: ${reason}\n📊 ${miner.summary()}`);
+      if (reason !== MANUAL_STOP && this.tg.activeBotId === this.id) this.tg.showBotMenu(this.id);
+    };
+    this.miner = miner;
+    miner.start();
   }
 
-  stopMiner() {
-    this.minerEnabled = false;
-    this.isMining = false;
-    if (this.bot && this.bot.pathfinder) this.bot.pathfinder.stop();
-    if (this.bot) try { this.bot.stopDigging(); } catch (_) {}
-    this.tg.sendMessage(`🛑 [${this.username}] Авто-Шахта ВЫКЛЮЧЕНА`);
+  stopMiner(reason = MANUAL_STOP) {
+    if (this.miner) this.miner.stop(reason);
   }
 
   // --- Invisibility ---
 
   startInvis() {
     if (this.invisEnabled) return;
+    this.stopMiner('включена невидимость'); // шахта и Shift мешают друг другу
     this.invisEnabled = true;
     this.tg.sendMessage(`👻 [${this.username}] Невидимость ВКЛЮЧЕНА (AFK Shift)`);
     if (this.bot) this.bot.setControlState('sneak', true);
@@ -662,321 +646,42 @@ class MinecraftBot {
   async invisLoop() {
     while (this.invisEnabled && this.bot && this.isConnected) {
       try {
-        if (!this.bot.entity) { await this.sleep(1000); continue; }
+        if (!this.bot.entity) { await sleep(1000); continue; }
 
         // Постоянно поддерживаем нажатым Shift
-        if (!this.bot.controlState.sneak) {
-          this.bot.setControlState('sneak', true);
-        }
+        if (!this.bot.controlState.sneak) this.bot.setControlState('sneak', true);
 
         // Проверяем эффект невидимости (ID = 14)
-        let hasInvis = false;
-        if (this.bot.entity.effects) {
-          // В mineflayer effects — это объект { id: Effect, ... }
-          hasInvis = !!this.bot.entity.effects[14];
-        }
+        const hasInvis = !!(this.bot.entity.effects && this.bot.entity.effects[14]);
 
         if (!hasInvis) {
-          // Ищем зелье невидимости
-          const potion = this.bot.inventory.items().find(i => 
-            i.name === 'potion' && 
-            i.nbt && 
-            i.nbt.value && 
-            i.nbt.value.Potion && 
-            i.nbt.value.Potion.value && 
-            i.nbt.value.Potion.value.includes('invisibility')
-          );
+          const potion = this.bot.inventory.items().find((i) =>
+            i.name === 'potion' &&
+            i.nbt && i.nbt.value && i.nbt.value.Potion && i.nbt.value.Potion.value &&
+            i.nbt.value.Potion.value.includes('invisibility'));
 
           if (potion) {
             this.tg.sendMessage(`🧪 [${this.username}] Пью зелье невидимости...`);
             await this.bot.equip(potion, 'hand');
             this.bot.activateItem();
-            await this.sleep(2000); // Питье занимает около 1.6 сек
+            await sleep(2000); // Питье занимает около 1.6 сек
             this.bot.deactivateItem();
-            await this.sleep(500);
-          } else {
+            await sleep(500);
+          } else if (Date.now() - this.lastInvisWarn > 60000) {
             // Если зелий нет, пишем предупреждение (не чаще 1 раза в минуту)
-            if (Date.now() - this.lastInvisWarn > 60000) {
-              this.tg.sendMessage(`⚠️ [${this.username}] Эффект невидимости спал, а зелий в инвентаре НЕТ!`);
-              this.lastInvisWarn = Date.now();
-            }
+            this.tg.sendMessage(`⚠️ [${this.username}] Эффект невидимости спал, а зелий в инвентаре НЕТ!`);
+            this.lastInvisWarn = Date.now();
           }
         }
       } catch (err) {
         console.error(`[MC ${this.username}] invisLoop error:`, err);
       }
-      
-      await this.sleep(2000);
-    }
-  }
-
-  async clearJunk() {
-    if (!this.bot || !this.bot.inventory) return;
-    if (this.bot.inventory.emptySlotCount() > 8) return; // Keep if >= 9 slots free
-
-    const keepItems = [
-      'netherite_pickaxe', 'diamond_pickaxe', 'experience_bottle', 'player_head',
-      'diamond', 'emerald', 'gold_ingot', 'iron_ingot', 'raw_gold', 'raw_iron',
-      'coal', 'lapis_lazuli', 'redstone', 'netherite_scrap', 'netherite_ingot', 'ancient_debris',
-      'tripwire_hook'
-    ];
-
-    const items = this.bot.inventory.items();
-    for (const item of items) {
-      if (!this.isMining) break;
-      if (!keepItems.includes(item.name)) {
-        try {
-          await this.bot.tossStack(item);
-          await this.sleep(200);
-        } catch (e) {}
-      }
-    }
-  }
-
-  async equipPickaxe() {
-    if (!this.bot || !this.bot.inventory) return false;
-    // Unequip pickaxe from off-hand if it's there
-    const offHand = this.bot.inventory.slots[45];
-    if (offHand && offHand.name.includes('pickaxe')) {
-      try { await this.bot.unequip('off-hand'); await this.sleep(200); } catch (_) {}
-    }
-    const tiers = ['netherite_pickaxe', 'diamond_pickaxe'];
-    for (const name of tiers) {
-      const pick = this.bot.inventory.items().find(i => i.name === name);
-      if (pick) {
-        try { await this.bot.equip(pick, 'hand'); return true; } catch (_) {}
-      }
-    }
-    const held = this.bot.heldItem;
-    return !!(held && tiers.includes(held.name));
-  }
-
-  async checkAndRepairPickaxe() {
-    if (!this.bot || !this.bot.inventory) return true;
-    const held = this.bot.heldItem;
-    if (!held || !held.name.includes('pickaxe') || held.durabilityUsed === undefined) return true;
-    
-    const remaining = held.maxDurability - held.durabilityUsed;
-    if (remaining > 100) return true;
-
-    const bottles = this.bot.inventory.items().find(i => i.name === 'experience_bottle');
-    if (!bottles) {
-      // Нет пузырьков и кирка почти сломана — стоп
-      this.tg.sendMessage(`⚠️ [${this.username}] Кирка ломается (${remaining}), но нет пузырьков опыта! Шахта остановлена.`);
-      this.stopMiner();
-      return false;
-    }
-
-    this.tg.sendMessage(`♻️ [${this.username}] Починка кирки (прочность: ${remaining})...`);
-    
-    try {
-      // Смотрим вниз чтобы пузырьки падали под ноги
-      await this.bot.look(this.bot.entity.yaw, Math.PI / 2, true);
-      await this.sleep(100);
-      
-      await this.bot.equip(bottles, 'off-hand');
-      while (this.isMining) {
-        const currentHeld = this.bot.heldItem;
-        if (!currentHeld || !currentHeld.name.includes('pickaxe')) break; // Кирка пропала
-        
-        const currentRemaining = currentHeld.maxDurability - currentHeld.durabilityUsed;
-        if (currentRemaining > currentHeld.maxDurability - 20) break; // Починили
-
-        const hasBottle = this.bot.inventory.slots[45] && this.bot.inventory.slots[45].name === 'experience_bottle';
-        if (!hasBottle) {
-           const moreBottles = this.bot.inventory.items().find(i => i.name === 'experience_bottle');
-           if (!moreBottles) break; // Пузырьки кончились — выходим, продолжаем копать
-           await this.bot.equip(moreBottles, 'off-hand');
-        }
-
-        this.bot.activateItem(true); // Right click with off-hand
-        await this.sleep(200);
-      }
-      this.bot.deactivateItem();
-      
-      // Возвращаем сферу (голову) в левую руку
-      const head = this.bot.inventory.items().find(i => i.name === 'player_head');
-      if (head) {
-        try { await this.bot.equip(head, 'off-hand'); } catch (_) {}
-      } else {
-        try { await this.bot.unequip('off-hand'); } catch (_) {}
-      }
-      
-      this.tg.sendMessage(`✅ [${this.username}] Кирка починена!`);
-      return true;
-    } catch (err) {
-      this.tg.sendMessage(`❌ [${this.username}] Ошибка починки: ${err.message}`);
-      return true; // Продолжаем копать даже при ошибке
-    }
-  }
-
-  async mineLoop() {
-    const mcData = require('minecraft-data')(this.bot.version);
-    const move = new Movements(this.bot, mcData);
-    move.allowFreeFall = true;
-    move.canDig = true; // Бот будет сам прокапывать путь
-    move.allow1by1towers = false;
-    move.maxDropDown = 6;
-    move.scafoldingBlocks = [];
-    this.bot.pathfinder.setMovements(move);
-
-    const targetBlocks = ['diamond_ore', 'emerald_ore', 'gold_ore', 'iron_ore', 'coal_ore', 'lapis_ore', 'redstone_ore', 'netherite_ore', 'ancient_debris'];
-    const targetIds = targetBlocks.map(name => this.bot.registry.blocksByName[name]?.id).filter(id => id != null);
-
-    // Перехватываем bot.dig — если бот на лестнице, сначала зажимаем Shift, потом копаем
-    const originalDig = this.bot.dig.bind(this.bot);
-    this.bot.dig = async (block, forceLook, digFace) => {
-      const pos = this.bot.entity?.position;
-      if (!pos) return originalDig(block, forceLook, digFace);
-      
-      const blockAtFeet = this.bot.blockAt(pos);
-      const blockAtHead = this.bot.blockAt(pos.offset(0, 1, 0));
-      const onLadder = (blockAtFeet && (blockAtFeet.name.includes('ladder') || blockAtFeet.name.includes('vine'))) ||
-                        (blockAtHead && (blockAtHead.name.includes('ladder') || blockAtHead.name.includes('vine')));
-      
-      if (onLadder) {
-        this.bot.setControlState('sneak', true);
-        await this.sleep(150); // Дать время зафиксироваться
-      }
-      
-      try {
-        return await originalDig(block, forceLook, digFace);
-      } finally {
-        if (onLadder) {
-          this.bot.setControlState('sneak', false);
-        }
-      }
-    };
-
-    let lastDigTime = Date.now();
-
-    while (this.isMining && this.bot && this.isConnected) {
-      try {
-        if (!this.bot.entity || !this.bot.entity.position) { await this.sleep(1000); continue; }
-
-        // Если за 12 секунд ни одного блока не сломано — перезапуск итерации
-        if (Date.now() - lastDigTime > 12000) {
-          if (this.bot.pathfinder) this.bot.pathfinder.stop();
-          this.bot.clearControlStates();
-          try { this.bot.stopDigging(); } catch(_) {}
-          lastDigTime = Date.now();
-          await this.sleep(500);
-          continue;
-        }
-
-        this.bot.clearControlStates();
-        await this.clearJunk();
-        if (!this.isMining) break;
-
-        const hasPick = await this.equipPickaxe();
-        if (!hasPick) {
-          this.tg.sendMessage(`❌ [${this.username}] Нет алмазной/незеритовой кирки!`);
-          this.stopMiner();
-          break;
-        }
-
-        const repaired = await this.checkAndRepairPickaxe();
-        if (!repaired) break;
-
-        // Поиск руды
-        const botPos = this.bot.entity.position;
-        let found = this.bot.findBlocks({ matching: targetIds, maxDistance: 32, count: 128 });
-        
-        const now = Date.now();
-        for (const [k, exp] of this.badBlocks) {
-          if (now > exp) this.badBlocks.delete(k);
-        }
-        
-        found = found.filter(pos => !this.badBlocks.has(`${pos.x},${pos.y},${pos.z}`));
-        if (found.length === 0) {
-          await this.sleep(1000);
-          continue;
-        }
-
-        found.sort((a, b) => botPos.distanceTo(a) - botPos.distanceTo(b));
-        const targetPos = found[0];
-        const key = `${targetPos.x},${targetPos.y},${targetPos.z}`;
-
-        // Берем голову в левую руку
-        const offHand = this.bot.inventory.slots[45];
-        if (!offHand || offHand.name !== 'player_head') {
-          const head = this.bot.inventory.items().find(i => i.name === 'player_head');
-          if (head) {
-            try { await this.bot.equip(head, 'off-hand'); } catch (_) {}
-          }
-        }
-
-        // Подход к блоку (патфайндер будет прокапывать путь)
-        let navDone = false;
-        const navPromise = this.bot.pathfinder.goto(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 3));
-        navPromise.then(() => navDone = true).catch(() => navDone = true);
-
-        let bestDist = botPos.distanceTo(targetPos);
-        let noProgressTicks = 0;
-        
-        while (!navDone && this.isMining) {
-          await this.sleep(500);
-          
-          // Проверка починки на ходу
-          const held = this.bot.heldItem;
-          if (held && held.name.includes('pickaxe') && held.durabilityUsed !== undefined) {
-            if (held.maxDurability - held.durabilityUsed < 100) {
-              if (this.bot.pathfinder) this.bot.pathfinder.stop();
-              navDone = true;
-              break;
-            }
-          }
-
-          // Проверка idle 12 сек (даже во время навигации)
-          if (Date.now() - lastDigTime > 12000) {
-            if (this.bot.pathfinder) this.bot.pathfinder.stop();
-            navDone = true;
-            break;
-          }
-          
-          // Проверка застревания
-          const curDist = this.bot.entity.position.distanceTo(targetPos);
-          if (curDist < bestDist - 0.2) {
-            bestDist = curDist;
-            noProgressTicks = 0;
-          } else {
-            noProgressTicks++;
-            if (noProgressTicks >= 8) { // 4 секунды без приближения
-              if (this.bot.pathfinder) this.bot.pathfinder.stop();
-              this.bot.clearControlStates();
-              this.badBlocks.set(key, Date.now() + 22000);
-              navDone = true;
-              break;
-            }
-          }
-        }
-
-        if (!this.isMining) break;
-
-        const dist = this.bot.entity.position.distanceTo(targetPos);
-        if (dist <= 5.5) {
-          const block = this.bot.blockAt(targetPos);
-          if (block && block.type !== 0 && block.name !== 'air' && block.name !== 'cave_air') {
-            try {
-              await this.bot.dig(block, true);
-              lastDigTime = Date.now(); // Успешно сломали блок
-            } catch (err) {
-              try { this.bot.stopDigging(); } catch(_) {}
-              this.badBlocks.set(key, Date.now() + 22000);
-            }
-          }
-        } else {
-          this.badBlocks.set(key, Date.now() + 22000);
-        }
-
-      } catch (err) {
-        console.error(`[MC ${this.username}] mineLoop error:`, err);
-        await this.sleep(1000);
-      }
+      await sleep(2000);
     }
   }
 
   // --- Utils ---
+
   extractJsonText(obj) {
     if (!obj) return '';
     if (typeof obj === 'string') {
@@ -985,7 +690,7 @@ class MinecraftBot {
     let res = '';
     if (typeof obj === 'object' && obj !== null) {
       if (typeof obj.text === 'string') res += obj.text;
-      if (Array.isArray(obj.extra)) res += obj.extra.map(o => this.extractJsonText(o)).join('');
+      if (Array.isArray(obj.extra)) res += obj.extra.map((o) => this.extractJsonText(o)).join('');
     }
     return res;
   }
@@ -999,14 +704,6 @@ class MinecraftBot {
       const obj = JSON.parse(reason);
       return obj.text || obj.translate || reason;
     } catch { return String(reason); }
-  }
-
-  escapeMarkdown(text) {
-    return String(text).replace(/([_*[\]()~`>#+=|{}.!-])/g, '\\$1');
-  }
-
-  sleep(ms) {
-    return new Promise(r => setTimeout(r, ms));
   }
 }
 
