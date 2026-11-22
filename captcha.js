@@ -16,9 +16,6 @@ const sharp  = require('sharp');
 const cfg    = require('./config');
 const util   = require('util');
 
-// Глобальный кэш карт для текущей сессии бота
-const mapCache = new Map();
-
 const MAP_SIZE = cfg.CAPTCHA_MAP_SIZE; // 128 px
 
 /**
@@ -224,8 +221,6 @@ function initMapListener(bot) {
 
   bot._client.on('map', (packet) => {
     if (packet.itemDamage !== undefined && packet.data && packet.data.length === MAP_SIZE * MAP_SIZE) {
-      console.log(`[MC DEBUG MAP] id=${packet.itemDamage} dataLen=${packet.data.length}`);
-      
       bot._mapCache.set(packet.itemDamage, packet.data);
       bot.emit('map_updated', packet.itemDamage);
     }

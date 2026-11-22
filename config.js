@@ -5,22 +5,34 @@
 
 require('dotenv').config();
 
+const int = (name, fallback) => {
+  const v = parseInt(process.env[name], 10);
+  return Number.isFinite(v) ? v : fallback;
+};
+
 module.exports = {
   // ─── Minecraft ────────────────────────────────────────────────────────────
-  MC_HOST: process.env.MC_HOST || '127.0.0.1',   // IP хаба (можно менять через /setip)
-  MC_PORT: parseInt(process.env.MC_PORT || '25565', 10),
-  MC_USERNAME: process.env.MC_USERNAME || 'MyBot',
-  MC_VERSION: '1.16.5',
+  // Ник, IP и порт каждого бота задаются в Telegram и хранятся в bots.json.
+  MC_VERSION: process.env.MC_VERSION || '1.16.5',
 
   // ─── Telegram ─────────────────────────────────────────────────────────────
   TG_TOKEN: process.env.TG_TOKEN || '',           // Токен бота от @BotFather
-  TG_CHAT_ID: process.env.TG_CHAT_ID || '',       // Ваш личный chat_id
+  TG_CHAT_ID: process.env.TG_CHAT_ID || '',       // Ваш личный chat_id — только он может управлять
 
   // ─── Фарм ────────────────────────────────────────────────────────────────
-  FARM_INTERVAL_MS: parseInt(process.env.FARM_INTERVAL_MS || '1500', 10), // мс между ударами
+  FARM_INTERVAL_MS: int('FARM_INTERVAL_MS', 1500), // мс между ударами
 
   // ─── Переподключение ──────────────────────────────────────────────────────
-  RECONNECT_DELAY_MS: parseInt(process.env.RECONNECT_DELAY_MS || '30000', 10),
+  RECONNECT_DELAY_MS: int('RECONNECT_DELAY_MS', 30000),
+
+  // ─── Шахта (подробности и остальные параметры — DEFAULTS в miner.js) ─────
+  MINER: {
+    lookahead: int('MINER_LOOKAHEAD', undefined),       // стенок вперёд за заход (3)
+    laneLength: int('MINER_LANE_LENGTH', undefined),    // длина ряда, 0 — до упора (0)
+    layerDepth: int('MINER_LAYER_DEPTH', undefined),    // спуск между слоями (3)
+    eatAt: int('MINER_EAT_AT', undefined),              // есть при сытости ≤ (14)
+    repairAt: int('MINER_REPAIR_AT', undefined),        // чинить бур при прочности ≤ (100)
+  },
 
   // ─── Капча ────────────────────────────────────────────────────────────────
   CAPTCHA_COLS: 4,   // колонок в сетке карт
